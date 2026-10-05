@@ -72,7 +72,12 @@ const WORKER_READY_TIMEOUT = Duration.seconds(30);
 const OWNER_HANDOVER_WINDOW = Duration.seconds(15);
 const WORKER_REQUEST_TIMEOUT_MS = 15_000;
 const STREAM_FLUSH_MS = 50;
-const PI_INHERIT_MODEL_SLUG = "default";
+/** Pi's "inherit the configured default" model slug; the worker says what it resolves to. */
+export const PI_INHERIT_MODEL_SLUG = "default";
+
+/** How to leave inspection: the release needs the owner lease, which the running worker holds. */
+export const DURABLE_INSPECTION_RELEASE_HINT =
+  "Stop T3.14, run `t3-14 inspect release --note <reason>` on the box, then start it again.";
 
 const DURABLE_REF_PATTERN = /^pi-durable:([0-9a-f-]+):(\d+)$/;
 
@@ -209,7 +214,12 @@ export interface DurableWorkerStatus {
 }
 
 export interface DurableWorker {
+  /** Status from the worker's `ready` frame. */
   readonly status: DurableWorkerStatus;
+  /** Status read from the worker now. */
+  readonly currentStatus: Effect.Effect<DurableWorkerStatus, PiDurableWorkerError>;
+  /** What a "default" model selection resolves to; null when the worker has no model. */
+  readonly defaultModel: { readonly provider: string; readonly modelId: string } | null;
   /** Tool profile the worker offers: `none`, `read` or `coding` (mutating). */
   readonly tools: string;
   readonly models: ReadonlyArray<DurableWorkerModel>;
@@ -240,6 +250,15 @@ function workerFailure(cause: unknown): PiDurableWorkerError {
     });
   }
   return new PiDurableWorkerError({ detail: String(cause), cause });
+}
+
+function parseWorkerStatus(record: unknown): DurableWorkerStatus {
+  return {
+    storeId: recordString(record, "storeId") ?? "",
+    ownerEpoch: recordNumber(record, "ownerEpoch") ?? 0,
+    scheduling: recordString(record, "scheduling") ?? "inhibited",
+    reasons: (recordField(record, "reasons") as ReadonlyArray<string> | undefined) ?? [],
+  };
 }
 
 const makeDurableWorker = Effect.fnUntraced(function* (input: {
@@ -280,13 +299,10 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
       detail: `worker speaks protocol ${String(ready["protocol"])}, adapter speaks ${DURABLE_WORKER_PROTOCOL}`,
     });
   }
-  const statusRecord = recordField(ready, "status");
-  const status: DurableWorkerStatus = {
-    storeId: recordString(statusRecord, "storeId") ?? "",
-    ownerEpoch: recordNumber(statusRecord, "ownerEpoch") ?? 0,
-    scheduling: recordString(statusRecord, "scheduling") ?? "inhibited",
-    reasons: (recordField(statusRecord, "reasons") as ReadonlyArray<string> | undefined) ?? [],
-  };
+  const status = parseWorkerStatus(recordField(ready, "status"));
+  const defaultRecord = recordField(ready, "defaultModel");
+  const defaultProvider = recordString(defaultRecord, "provider");
+  const defaultModelId = recordString(defaultRecord, "modelId");
   const models = ((recordField(ready, "models") as ReadonlyArray<DurableWorkerModel> | undefined) ??
     []) as ReadonlyArray<DurableWorkerModel>;
 
@@ -326,14 +342,22 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
     Effect.forkIn(scope),
   );
 
+  const request: DurableWorker["request"] = (
+    method,
+    params = {},
+    timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
+  ) =>
+    connection.request({ ...params, type: method }, timeoutMs).pipe(Effect.mapError(workerFailure));
   return {
     status,
+    currentStatus: request("owner.status").pipe(Effect.map(parseWorkerStatus)),
+    defaultModel:
+      defaultProvider === undefined || defaultModelId === undefined
+        ? null
+        : { provider: defaultProvider, modelId: defaultModelId },
     tools: recordString(ready, "tools") ?? "none",
     models,
-    request: (method, params = {}, timeoutMs = WORKER_REQUEST_TIMEOUT_MS) =>
-      connection
-        .request({ ...params, type: method }, timeoutMs)
-        .pipe(Effect.mapError(workerFailure)),
+    request,
     subscribe: (conversationId) =>
       Effect.acquireRelease(
         Effect.gen(function* () {
@@ -525,7 +549,7 @@ export function makePiDurableAdapterV2(
             Effect.mapError((cause) =>
               protocolError(
                 cause.errorName === "SchedulingInhibited"
-                  ? `the durable runtime is not scheduling work (${cause.detail}). Release it on the box with \`t3-14 inspect release\`.`
+                  ? `the durable runtime is not scheduling work (${cause.detail}). ${DURABLE_INSPECTION_RELEASE_HINT}`
                   : `worker ${method} failed: ${cause.detail}`,
                 cause.errorName === undefined ? undefined : { errorName: cause.errorName },
               ),
@@ -581,6 +605,14 @@ export function makePiDurableAdapterV2(
           providerThread = { ...providerThread, ...patch, updatedAt: yield* DateTime.now };
           yield* emit({ type: "provider_thread.updated", driver: PI_PROVIDER, providerThread });
         });
+
+      /** The concrete `provider/model` slug a selection runs on; "default" asks the worker. */
+      const resolveSlug = (slug: string): string | null =>
+        slug !== PI_INHERIT_MODEL_SLUG
+          ? slug
+          : worker.defaultModel === null
+            ? null
+            : `${worker.defaultModel.provider}/${worker.defaultModel.modelId}`;
 
       const contextWindowFor = (slug: string | null): number | null => {
         const parsed = slug === null ? null : parsePiModelSlug(slug);
@@ -1219,15 +1251,19 @@ export function makePiDurableAdapterV2(
           }
           opened = yield* call("conversation.open", { conversationId: parsed.conversationId });
         } else {
-          const model =
-            threadInput.modelSelection.model === PI_INHERIT_MODEL_SLUG
-              ? null
-              : parsePiModelSlug(threadInput.modelSelection.model);
+          const slug = resolveSlug(threadInput.modelSelection.model);
+          if (slug === null) {
+            return yield* protocolError("the durable worker has no model to use as Pi's default");
+          }
+          const model = parsePiModelSlug(slug);
+          if (model === null) {
+            return yield* protocolError(`Pi model '${slug}' must use provider/model format`);
+          }
           opened = yield* call("conversation.open", {
             cwd: threadInput.runtimePolicy.cwd ?? cwd,
-            ...(model === null ? {} : { model }),
+            model,
           });
-          if (model !== null) appliedModel = threadInput.modelSelection.model;
+          appliedModel = slug;
         }
         const id = recordNumber(opened, "conversationId");
         const nativeId = recordString(opened, "nativeThreadRef");
@@ -1274,12 +1310,14 @@ export function makePiDurableAdapterV2(
         if (conversationId === null) return;
         const thinking = getModelSelectionStringOptionValue(selection, "thinking");
         const change: PiRpcRecord = {};
-        if (selection.model !== PI_INHERIT_MODEL_SLUG && selection.model !== appliedModel) {
-          const parsed = parsePiModelSlug(selection.model);
+        const target = resolveSlug(selection.model);
+        if (target === null) {
+          return yield* protocolError("the durable worker has no model to use as Pi's default");
+        }
+        if (target !== appliedModel) {
+          const parsed = parsePiModelSlug(target);
           if (parsed === null) {
-            return yield* protocolError(
-              `Pi model '${selection.model}' must use provider/model format`,
-            );
+            return yield* protocolError(`Pi model '${target}' must use provider/model format`);
           }
           change["model"] = parsed;
         }
@@ -1288,7 +1326,7 @@ export function makePiDurableAdapterV2(
         if (Object.keys(change).length === 0) return;
         yield* call("conversation.configure", { conversationId, ...change });
         if (change["model"] !== undefined) {
-          appliedModel = selection.model;
+          appliedModel = target;
           sessionEntity = {
             ...sessionEntity,
             model: selection.model,
@@ -1370,7 +1408,7 @@ export function makePiDurableAdapterV2(
         events: Stream.fromQueue(events),
         getModelContextWindow: (selection) =>
           selection.instanceId === options.instanceId
-            ? (contextWindowFor(selection.model) ?? undefined)
+            ? (contextWindowFor(resolveSlug(selection.model)) ?? undefined)
             : undefined,
         ensureThread: (threadInput) =>
           registerThread(threadInput).pipe(

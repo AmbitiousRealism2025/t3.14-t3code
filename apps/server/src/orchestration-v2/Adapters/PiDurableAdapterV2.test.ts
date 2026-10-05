@@ -195,9 +195,12 @@ describe.skipIf(WORKER_CLI === undefined)("PiDurableAdapterV2 (real worker)", ()
   it.live("streams a turn through the worker and completes it", () =>
     Effect.gen(function* () {
       const box = yield* sandbox;
-      const { adapter } = yield* openAdapter(box);
+      const { adapter, workers } = yield* openAdapter(box);
       const { runtime, takeEvent, seen } = yield* openRuntime(adapter, box.workspace);
       const providerThread = yield* ensureThread(runtime, box.workspace);
+      const worker = yield* workers.get;
+      assert.deepStrictEqual(worker.defaultModel, { provider: "faux", modelId: "faux-1" });
+      assert.strictEqual((yield* worker.currentStatus).scheduling, "enabled");
       assert.match(providerThread.nativeThreadRef?.nativeId ?? "", /^pi-durable:[0-9a-f-]+:\d+$/);
 
       yield* startTurn(runtime, providerThread, box.workspace, "hello durable");

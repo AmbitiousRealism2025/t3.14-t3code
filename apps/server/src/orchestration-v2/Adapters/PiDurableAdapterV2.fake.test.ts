@@ -59,6 +59,13 @@ const makeFakeWorker = (handlers: Record<string, Handler>) =>
     const requests: Array<{ readonly method: string; readonly params: PiRpcRecord }> = [];
     const worker: DurableWorker = {
       status: { storeId: STORE_ID, ownerEpoch: 1, scheduling: "enabled", reasons: [] },
+      currentStatus: Effect.succeed({
+        storeId: STORE_ID,
+        ownerEpoch: 1,
+        scheduling: "enabled",
+        reasons: [],
+      }),
+      defaultModel: { provider: "faux", modelId: "faux-1" },
       tools: "read",
       models: [
         {
@@ -108,7 +115,7 @@ const defaultHandlers: Record<string, Handler> = {
   "conversation.watch": () => Effect.succeed({ snapshot: {} }),
 };
 
-const openRuntime = Effect.fnUntraced(function* (worker: DurableWorker) {
+const openRuntime = Effect.fnUntraced(function* (worker: DurableWorker, model = MODEL) {
   const adapter = makePiDurableAdapterV2({
     instanceId: INSTANCE_ID,
     workers: { get: Effect.succeed(worker) },
@@ -118,7 +125,7 @@ const openRuntime = Effect.fnUntraced(function* (worker: DurableWorker) {
   const runtime = yield* adapter.openSession({
     threadId: THREAD_ID,
     providerSessionId: ProviderSessionId.make("session-fake"),
-    modelSelection: { instanceId: INSTANCE_ID, model: MODEL },
+    modelSelection: { instanceId: INSTANCE_ID, model },
     runtimePolicy: policy,
   });
   const seen: ProviderAdapterV2Event[] = [];
@@ -128,7 +135,7 @@ const openRuntime = Effect.fnUntraced(function* (worker: DurableWorker) {
   );
   const providerThread = yield* runtime.ensureThread({
     threadId: THREAD_ID,
-    modelSelection: { instanceId: INSTANCE_ID, model: MODEL },
+    modelSelection: { instanceId: INSTANCE_ID, model },
     runtimePolicy: policy,
   });
   return { runtime, seen, providerThread };
@@ -292,6 +299,15 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
         fake.requests.some((request) => request.method === "conversation.submit"),
         "nothing is admitted",
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("Pi's default selection opens the conversation on the worker's default model", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker(defaultHandlers);
+      yield* openRuntime(fake.worker, "default");
+      const open = fake.requests.find((request) => request.method === "conversation.open");
+      assert.deepStrictEqual(open?.params["model"], { provider: "faux", modelId: "faux-1" });
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

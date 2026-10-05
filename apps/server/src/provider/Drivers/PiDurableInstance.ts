@@ -18,8 +18,12 @@ import * as Effect from "effect/Effect";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
 import {
+  DURABLE_INSPECTION_RELEASE_HINT,
   makeDurableWorkerManager,
   makePiDurableAdapterV2,
+  PI_INHERIT_MODEL_SLUG,
+  type DurableWorkerModel,
+  type DurableWorkerStatus,
 } from "../../orchestration-v2/Adapters/PiDurableAdapterV2.ts";
 import * as ServerConfig from "../../config.ts";
 import { ProviderDriverError } from "../Errors.ts";
@@ -52,6 +56,60 @@ const PRESENTATION = {
   reportsContextWindow: true,
   requiresNewThreadForModelChange: false,
 } as const;
+
+type ProviderProbe = Parameters<typeof buildServerProvider>[0]["probe"];
+
+/**
+ * Health and model catalog for a running worker. The catalog leads with Pi's
+ * "default" entry, which the adapter resolves to the worker's default model,
+ * so saved `default` selections keep their meaning.
+ */
+export function durableProviderProbe(input: {
+  readonly status: DurableWorkerStatus;
+  readonly models: ReadonlyArray<DurableWorkerModel>;
+  readonly defaultModel: { readonly provider: string; readonly modelId: string } | null;
+}): { readonly probe: ProviderProbe; readonly models: ServerProvider["models"] } {
+  const enabled = input.status.scheduling === "enabled";
+  const defaultName =
+    input.defaultModel === null
+      ? null
+      : (input.models.find(
+          (model) =>
+            model.provider === input.defaultModel?.provider &&
+            model.modelId === input.defaultModel.modelId,
+        )?.name ?? `${input.defaultModel.provider}/${input.defaultModel.modelId}`);
+  return {
+    probe: {
+      installed: true,
+      version: null,
+      status: enabled ? "ready" : "warning",
+      auth: { status: input.models.length > 0 ? "authenticated" : "unauthenticated" },
+      ...(enabled
+        ? {}
+        : {
+            message: `Durable runtime is in inspection (${input.status.reasons.join(", ")}). ${DURABLE_INSPECTION_RELEASE_HINT}`,
+          }),
+    },
+    models: [
+      ...(defaultName === null
+        ? []
+        : [
+            {
+              slug: PI_INHERIT_MODEL_SLUG,
+              name: `Pi default (${defaultName})`,
+              isCustom: false,
+              capabilities: EMPTY_PI_MODEL_CAPABILITIES,
+            },
+          ]),
+      ...input.models.map((model) => ({
+        slug: `${model.provider}/${model.modelId}`,
+        name: model.name,
+        isCustom: false,
+        capabilities: EMPTY_PI_MODEL_CAPABILITIES,
+      })),
+    ],
+  };
+}
 
 export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
   input: ProviderDriverCreateInput<PiSettings>,
@@ -96,27 +154,19 @@ export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
 
   const checkProvider = enabled
     ? workers.get.pipe(
+        // Read the barrier now: an inspection can end between refreshes.
         Effect.flatMap((worker) =>
-          describe(
-            {
-              installed: true,
-              version: null,
-              status: worker.status.scheduling === "enabled" ? "ready" : "warning",
-              auth: { status: worker.models.length > 0 ? "authenticated" : "unauthenticated" },
-              ...(worker.status.scheduling === "enabled"
-                ? {}
-                : {
-                    message: `Durable runtime is in inspection (${worker.status.reasons.join(", ")}). Release it on the box with \`t3-14 inspect release\`.`,
-                  }),
-            },
-            worker.models.map((model) => ({
-              slug: `${model.provider}/${model.modelId}`,
-              name: model.name,
-              isCustom: false,
-              capabilities: EMPTY_PI_MODEL_CAPABILITIES,
-            })),
+          worker.currentStatus.pipe(
+            Effect.map((status) =>
+              durableProviderProbe({
+                status,
+                models: worker.models,
+                defaultModel: worker.defaultModel,
+              }),
+            ),
           ),
         ),
+        Effect.flatMap(({ probe, models }) => describe(probe, models)),
         Effect.catch((error) =>
           describe({
             installed: false,
