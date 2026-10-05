@@ -833,6 +833,17 @@ export const AntigravitySettings = makeProviderSettingsSchema(
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
 
+/**
+ * T3.14 durable worker launch: `command args...` starts a process that speaks
+ * the durable worker protocol (Pi RPC framing) on stdio, for example
+ * `node /path/to/t3-14/cli.ts worker --data-home ~/.t3.14`.
+ */
+export const PiDurableSettings = Schema.Struct({
+  command: TrimmedString,
+  args: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+});
+export type PiDurableSettings = typeof PiDurableSettings.Type;
+
 export const PiSettings = makeProviderSettingsSchema(
   {
     // Off by default like Cursor and Grok. Users opt in from Settings.
@@ -857,6 +868,11 @@ export const PiSettings = makeProviderSettingsSchema(
     ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    // T3.14: run this instance on the box-side Pi-Durable worker instead of
+    // `pi --mode rpc`. Box configuration only, so clients never render it.
+    durable: Schema.optionalKey(PiDurableSettings).pipe(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
