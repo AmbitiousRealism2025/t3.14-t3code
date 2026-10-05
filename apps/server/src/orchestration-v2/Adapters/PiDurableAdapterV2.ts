@@ -35,6 +35,7 @@ import {
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -359,24 +360,37 @@ export const makeDurableWorkerManager = Effect.fnUntraced(function* (input: {
   readonly launch: PiDurableSettings;
   readonly env: NodeJS.ProcessEnv;
 }) {
-  const instanceScope = yield* Effect.scope;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const permit = yield* Semaphore.make(1);
   let current: { readonly worker: DurableWorker; readonly scope: Scope.Closeable } | null = null;
+  // Stopping a worker waits out PiRpc's termination grace in wall-clock time,
+  // including under a test clock, so the instance closes it on the live clock.
+  const liveClock = Effect.provideService(Clock.Clock, Clock.Clock.defaultValue());
+  yield* Effect.addFinalizer(() =>
+    permit
+      .withPermits(1)(
+        Effect.suspend(() => {
+          const closing = current;
+          current = null;
+          return closing === null ? Effect.void : Scope.close(closing.scope, Exit.void);
+        }),
+      )
+      .pipe(liveClock),
+  );
 
   const get: Effect.Effect<DurableWorker, PiDurableWorkerError> = permit.withPermits(1)(
     Effect.gen(function* () {
       if (current !== null && current.worker.isAlive()) return current.worker;
       if (current !== null) {
-        yield* Scope.close(current.scope, Exit.void);
+        yield* Scope.close(current.scope, Exit.void).pipe(liveClock);
         current = null;
       }
       const attempt = Effect.gen(function* () {
-        const workerScope = yield* Scope.fork(instanceScope);
+        const workerScope = yield* Scope.make("sequential");
         return yield* makeDurableWorker(input).pipe(
           Scope.provide(workerScope),
           Effect.map((worker) => ({ worker, scope: workerScope })),
-          Effect.tapError(() => Scope.close(workerScope, Exit.void)),
+          Effect.tapError(() => Scope.close(workerScope, Exit.void).pipe(liveClock)),
         );
       });
       const started = yield* attempt.pipe(
@@ -442,6 +456,8 @@ interface StreamItemState {
   text: string;
   completed: boolean;
   flushScheduled: boolean;
+  /** The first update goes out at once; later ones are throttled. */
+  emitted: boolean;
   readonly startedAt: DateTime.Utc;
 }
 
@@ -705,6 +721,10 @@ export function makePiDurableAdapterV2(
       const scheduleStreamFlush = (turn: ActiveDurableTurn, item: StreamItemState) =>
         Effect.gen(function* () {
           if (item.flushScheduled || item.completed) return;
+          if (!item.emitted) {
+            item.emitted = true;
+            return yield* emitStreamItem(turn, item, true);
+          }
           item.flushScheduled = true;
           yield* Effect.sleep(Duration.millis(STREAM_FLUSH_MS)).pipe(
             Effect.andThen(
@@ -733,6 +753,7 @@ export function makePiDurableAdapterV2(
           text: "",
           completed: false,
           flushScheduled: false,
+          emitted: false,
           startedAt: yield* DateTime.now,
         };
         turn.streamItems.set(nativeItemId, item);
