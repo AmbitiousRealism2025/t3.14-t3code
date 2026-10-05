@@ -372,6 +372,71 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("a steer during resumed work queues behind the turn instead of steering it", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [99] } } }),
+        "conversation.submit": (params) =>
+          Effect.succeed({
+            submissionId: params["whenBusy"] === "followUp" ? 1 : 2,
+            status: "queued",
+          }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      yield* runtime.startTurn(input);
+      const running = yield* next(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      if (running.type !== "provider_turn.updated") return assert.fail("no running turn");
+      yield* runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: input.runId,
+        providerThread,
+        providerTurnId: running.providerTurn.id,
+        message: { ...input.message, messageId: `message:${THREAD_ID}:2` as never },
+      });
+      const modes = fake.requests.flatMap((request) =>
+        request.method === "conversation.submit" ? [request.params["whenBusy"]] : [],
+      );
+      assert.deepStrictEqual(modes, ["followUp", "followUp"]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("an admission a rebind saw as foreign still settles its turn", () =>
+    Effect.gen(function* () {
+      const submitAnswer = yield* Deferred.make<unknown>();
+      const submitSent = yield* Deferred.make<void>();
+      let watches = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        // The second watch (the rebind) already sees submission 1 running.
+        "conversation.watch": () => {
+          watches += 1;
+          return Effect.succeed({ snapshot: watches === 1 ? {} : { run: { inputs: [1] } } });
+        },
+        "conversation.submit": () =>
+          Deferred.succeed(submitSent, undefined).pipe(
+            Effect.andThen(Deferred.await(submitAnswer)),
+          ),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const starting = yield* runtime
+        .startTurn(yield* turnInput(providerThread))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(submitSent);
+      yield* runtime.resumeThread({ providerThread });
+      // The answer settles before the submit call returns its ID.
+      yield* fake.push(settled(1), { type: "run_end", inputs: [1] });
+      yield* Deferred.succeed(submitAnswer, { submissionId: 1, status: "placed" });
+      yield* Fiber.join(starting);
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({

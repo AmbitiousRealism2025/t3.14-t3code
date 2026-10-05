@@ -1028,7 +1028,12 @@ export function makePiDurableAdapterV2(
           const status = recordString(record, "status");
           if (record === undefined || id === undefined) return;
           if (status !== "done" && status !== "unanswered") return;
-          if (foreignSubmissions.delete(id)) return;
+          if (foreignSubmissions.delete(id)) {
+            // Kept in case a rebind marked one of our in-flight admissions
+            // foreign; `admitReserved` claims it once the ID comes back.
+            earlySettlements.set(id, record);
+            return;
+          }
           const turn = activeTurn;
           if (turn !== null && turn.submissions.has(id)) {
             turn.submissions.set(id, record);
@@ -1417,6 +1422,8 @@ export function makePiDurableAdapterV2(
           Effect.gen(function* () {
             turn.pendingAdmissions -= 1;
             if (admitted._tag === "Success") {
+              // A rebind during the call can have seen this ID as foreign.
+              foreignSubmissions.delete(admitted.value);
               const early = earlySettlements.get(admitted.value);
               earlySettlements.delete(admitted.value);
               turn.submissions.set(admitted.value, early ?? null);
@@ -1612,7 +1619,10 @@ export function makePiDurableAdapterV2(
                 return Effect.succeed(current);
               }),
             );
-            yield* admitReserved(turn, steerInput.message, "steer");
+            // Steering goes into whichever run is executing. While that is
+            // resumed work no T3 turn owns, queue the message behind this
+            // turn's own input instead; the turn waits for both.
+            yield* admitReserved(turn, steerInput.message, runIsForeign ? "followUp" : "steer");
           }).pipe(
             Effect.mapError(
               (cause) =>
