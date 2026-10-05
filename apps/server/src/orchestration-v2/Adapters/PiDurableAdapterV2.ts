@@ -1344,36 +1344,35 @@ export function makePiDurableAdapterV2(
       });
 
       /**
-       * Admit one input for `turn`. The admission is counted before the call,
-       * so a settlement that lands while it is in flight cannot end the turn
-       * and orphan the new submission's answer.
+       * Admit one input for `turn`, whose admission the caller reserved under
+       * `permit` in the same critical section that found the turn active. The
+       * turn cannot end while a reservation is open, so a settlement that lands
+       * during the call cannot orphan the new submission's answer.
        */
-      const submit = Effect.fnUntraced(function* (
+      const admitReserved = Effect.fnUntraced(function* (
         turn: ActiveDurableTurn,
         message: ProviderAdapter.ProviderAdapterV2TurnMessage,
         whenBusy: "steer" | "followUp",
       ) {
-        // The worker accepts text only; images and files are parity work (W07).
-        if (message.attachments.length > 0) {
-          return yield* protocolError(
-            "the durable runtime does not accept attachments yet; send the message without them",
-          );
-        }
-        yield* permit.withPermits(1)(Effect.sync(() => (turn.pendingAdmissions += 1)));
-        const admitted = yield* call("conversation.submit", {
-          conversationId,
-          requestId: `t3:${turn.turnInput.threadId}:${message.messageId}`,
-          text: message.text,
-          whenBusy,
-        }).pipe(
-          Effect.flatMap((result) => {
-            const submissionId = recordNumber(result, "submissionId");
-            return submissionId === undefined
-              ? Effect.fail(protocolError("worker returned no submission", result))
-              : Effect.succeed(submissionId);
-          }),
-          Effect.exit,
-        );
+        const admitted = yield* Effect.gen(function* () {
+          // The worker accepts text only; images and files are parity work (W07).
+          if (message.attachments.length > 0) {
+            return yield* protocolError(
+              "the durable runtime does not accept attachments yet; send the message without them",
+            );
+          }
+          const result = yield* call("conversation.submit", {
+            conversationId,
+            requestId: `t3:${turn.turnInput.threadId}:${message.messageId}`,
+            text: message.text,
+            whenBusy,
+          });
+          const submissionId = recordNumber(result, "submissionId");
+          if (submissionId === undefined) {
+            return yield* protocolError("worker returned no submission", result);
+          }
+          return submissionId;
+        }).pipe(Effect.exit);
         yield* permit.withPermits(1)(
           Effect.gen(function* () {
             turn.pendingAdmissions -= 1;
@@ -1507,6 +1506,7 @@ export function makePiDurableAdapterV2(
             yield* permit.withPermits(1)(
               Effect.gen(function* () {
                 activeTurn = turn;
+                turn.pendingAdmissions = 1;
                 yield* emit({
                   type: "provider_turn.updated",
                   driver: PI_PROVIDER,
@@ -1521,7 +1521,7 @@ export function makePiDurableAdapterV2(
                 yield* updateProviderSession("running", null);
               }),
             );
-            yield* submit(turn, turnInput.message, "followUp").pipe(
+            yield* admitReserved(turn, turnInput.message, "followUp").pipe(
               Effect.tapError(() =>
                 permit.withPermits(1)(
                   Effect.gen(function* () {
@@ -1558,13 +1558,21 @@ export function makePiDurableAdapterV2(
           ),
         steerTurn: (steerInput) =>
           Effect.gen(function* () {
-            const turn = activeTurn;
-            if (turn === null || turn.providerTurn.id !== steerInput.providerTurnId) {
-              return yield* protocolError(
-                `durable turn ${steerInput.providerTurnId} is not active`,
-              );
-            }
-            yield* submit(turn, steerInput.message, "steer");
+            // Find the turn active and reserve its admission in one critical
+            // section, so the event pump cannot end it in between.
+            const turn = yield* permit.withPermits(1)(
+              Effect.suspend(() => {
+                const current = activeTurn;
+                if (current === null || current.providerTurn.id !== steerInput.providerTurnId) {
+                  return Effect.fail(
+                    protocolError(`durable turn ${steerInput.providerTurnId} is not active`),
+                  );
+                }
+                current.pendingAdmissions += 1;
+                return Effect.succeed(current);
+              }),
+            );
+            yield* admitReserved(turn, steerInput.message, "steer");
           }).pipe(
             Effect.mapError(
               (cause) =>

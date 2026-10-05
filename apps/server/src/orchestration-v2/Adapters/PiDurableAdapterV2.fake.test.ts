@@ -276,6 +276,63 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("a steer racing the settlement is either refused or keeps the turn open", () =>
+    Effect.gen(function* () {
+      // Fiber scheduling decides which side wins each round; the invariant
+      // must hold for every interleaving.
+      for (let round = 0; round < 40; round += 1) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            let submits = 0;
+            const fake = yield* makeFakeWorker({
+              ...defaultHandlers,
+              "conversation.submit": () => {
+                submits += 1;
+                return Effect.succeed({ submissionId: submits, status: "placed" });
+              },
+            });
+            const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+            const input = yield* turnInput(providerThread);
+            yield* runtime.startTurn(input);
+            const running = yield* next(
+              (event) =>
+                event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+            );
+            if (running.type !== "provider_turn.updated") return assert.fail("no running turn");
+            const steer = runtime
+              .steerTurn({
+                threadId: THREAD_ID,
+                runId: input.runId,
+                providerThread,
+                providerTurnId: running.providerTurn.id,
+                message: { ...input.message, messageId: `message:${THREAD_ID}:2` as never },
+              })
+              .pipe(Effect.exit);
+            const [steered] = yield* Effect.all([steer, fake.push(settled(1))], {
+              concurrency: "unbounded",
+            });
+            if (steered._tag === "Failure") {
+              // Refused: the turn had already ended on submission 1.
+              const ended = yield* next(isTerminal);
+              assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+              assert.strictEqual(submits, 1, "a refused steer admits nothing");
+              return;
+            }
+            // Admitted: the turn must wait for the steer's own submission.
+            yield* fake.push(marker(`round ${round}`));
+            const first = yield* next(
+              (event) => isTerminal(event) || isMarker(`round ${round}`)(event),
+            );
+            assert.isFalse(isTerminal(first), `round ${round}: an admitted steer was orphaned`);
+            yield* fake.push(settled(2));
+            const ended = yield* next(isTerminal);
+            assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+          }),
+        );
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({
