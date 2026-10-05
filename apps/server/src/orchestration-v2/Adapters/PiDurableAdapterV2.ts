@@ -301,7 +301,7 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
       detail: `worker speaks protocol ${String(ready["protocol"])}, adapter speaks ${DURABLE_WORKER_PROTOCOL}`,
     });
   }
-  const status = parseWorkerStatus(recordField(ready, "status"));
+  const booted = parseWorkerStatus(recordField(ready, "status"));
   const defaultRecord = recordField(ready, "defaultModel");
   const defaultProvider = recordString(defaultRecord, "provider");
   const defaultModelId = recordString(defaultRecord, "modelId");
@@ -350,6 +350,20 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
     timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
   ) =>
     connection.request({ ...params, type: method }, timeoutMs).pipe(Effect.mapError(workerFailure));
+  // A worker boots holding everything it recovered (D03). Stock T3 cancels
+  // unsettled runs when it restarts, so recovered durable work is aborted to
+  // match before any of it can run unseen; resuming it instead is W02.
+  const status =
+    booted.reasons.length === 1 && booted.reasons[0] === "reconciliation-pending"
+      ? yield* request("owner.reconcile", { policy: "abort-recovered" }).pipe(
+          Effect.tap((result) =>
+            Effect.logInfo("Pi-Durable worker reconciled recovered work", {
+              aborted: recordField(result, "aborted"),
+            }),
+          ),
+          Effect.map((result) => parseWorkerStatus(recordField(result, "status"))),
+        )
+      : booted;
   return {
     status,
     currentStatus: request("owner.status").pipe(Effect.map(parseWorkerStatus)),
@@ -1344,7 +1358,7 @@ export function makePiDurableAdapterV2(
                 ...existing,
                 providerSessionId: input.providerSessionId,
                 nativeThreadRef: providerRef(nativeId),
-                status: "idle",
+                status: activeTurn === null ? "idle" : "active",
                 updatedAt: createdAt,
               }
             : {
@@ -1359,7 +1373,7 @@ export function makePiDurableAdapterV2(
                 ownerNodeId: null,
                 nativeThreadRef: providerRef(nativeId),
                 nativeConversationHeadRef: null,
-                status: "idle",
+                status: activeTurn === null ? "idle" : "active",
                 firstRunOrdinal: null,
                 lastRunOrdinal: null,
                 handoffIds: [],

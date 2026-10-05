@@ -4,8 +4,9 @@
  * the real T3.14 worker and its fixture model, and back into projections.
  * Runs only when `T314_WORKER_CLI` points at the worker CLI.
  *
- * The restart case is exploratory S01 evidence: it records what stock T3
- * recovery does to a run whose durable submission outlives the server.
+ * The restart case covers D03 step 1: stock recovery cancels the T3 run, and
+ * the restarted worker aborts the recovered durable work before it can run
+ * unseen, so the two stores agree. Resuming it instead is W02.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -249,7 +250,7 @@ describe.skipIf(WORKER_CLI === undefined)(
       ),
     );
 
-    it.effect("exploratory: a server restart mid-turn under stock recovery", () =>
+    it.effect("a server restart mid-turn cancels the run in both stores (D03 step 1)", () =>
       Effect.gen(function* () {
         const box = yield* sandbox;
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -302,8 +303,7 @@ describe.skipIf(WORKER_CLI === undefined)(
         );
         const projection = projectionFor(after, SCENARIO);
 
-        // Recorded, not endorsed: what stock recovery does to the T3 run while
-        // the durable submission survives in the worker's store.
+        // What a restart now leaves in T3 and in the durable store.
         const observation = {
           runStatusesAfterRecovery: afterRecovery.runs.map((entry) => entry.status),
           runStatusesAfterNextMessage: projection.runs.map((entry) => entry.status),
@@ -334,6 +334,13 @@ describe.skipIf(WORKER_CLI === undefined)(
         }
         assert.equal(afterRecovery.runs[0]?.status, "cancelled");
         assert.equal(projection.runs[1]?.status, "completed");
+        // The recovered answer was aborted, not finished unseen (S01-E05).
+        assert.deepEqual(
+          observation.durableTranscript.flatMap((entry) =>
+            entry.role === "assistant" && entry.stopReason === "stop" ? [entry.text] : [],
+          ),
+          ["echo: after the restart"],
+        );
       }).pipe(
         Effect.scoped,
         provideDeterministicTestRuntime,

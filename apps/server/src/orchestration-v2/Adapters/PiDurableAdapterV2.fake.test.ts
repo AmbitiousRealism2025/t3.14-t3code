@@ -590,6 +590,27 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("a rebind during a running turn keeps the provider thread active", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.submit": () => Effect.succeed({ submissionId: 1, status: "placed" }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn(yield* turnInput(providerThread));
+      yield* next(
+        (event) =>
+          event.type === "provider_thread.updated" && event.providerThread.status === "active",
+      );
+      const rebound = yield* runtime.resumeThread({ providerThread });
+      assert.strictEqual(rebound.status, "active");
+      const emitted = yield* next((event) => event.type === "provider_thread.updated");
+      assert.isTrue(
+        emitted.type === "provider_thread.updated" && emitted.providerThread.status === "active",
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({
