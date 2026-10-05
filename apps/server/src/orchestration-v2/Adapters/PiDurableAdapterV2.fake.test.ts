@@ -333,6 +333,45 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("work resumed from before a restart stays out of the next turn", () =>
+    Effect.gen(function* () {
+      // The store resumed submission 99 at boot and has 98 queued behind it;
+      // no T3 turn owns either.
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () =>
+          Effect.succeed({
+            snapshot: { run: { inputs: [99] }, inbox: [{ id: 98, mode: "followUp" }] },
+          }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 1, status: "queued" }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn(yield* turnInput(providerThread));
+      yield* fake.push(
+        marker("resumed answer"),
+        { type: "run_end", inputs: [99] },
+        { type: "submission", record: { id: 99, status: "done", answer: 990 } },
+        { type: "run_start", inputs: [98] },
+      );
+      yield* fake.push(
+        marker("queued answer"),
+        { type: "run_end", inputs: [98] },
+        { type: "submission", record: { id: 98, status: "done", answer: 980 } },
+        { type: "run_start", inputs: [1] },
+      );
+      yield* fake.push(marker("our answer"), settled(1), { type: "run_end", inputs: [1] });
+      const first = yield* next(
+        (event) => event.type === "message.updated" || event.type === "turn.terminal",
+      );
+      assert.isTrue(
+        first.type === "message.updated" && first.message.text === "our answer",
+        "the first output in the turn is its own",
+      );
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({

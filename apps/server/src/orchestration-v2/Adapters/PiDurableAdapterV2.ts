@@ -584,6 +584,15 @@ export function makePiDurableAdapterV2(
       let appliedThinking: string | null = null;
       /** Settlement records that arrived before their submit call returned. */
       const earlySettlements = new Map<number, PiRpcRecord>();
+      /**
+       * Submissions already in the conversation when this session bound it:
+       * work resumed from before a restart that no T3 turn owns. A run made of
+       * them only is not attributed to the active turn. Deciding what to do
+       * with such work is the D03 reconcile; until then its output stays out
+       * of the next turn.
+       */
+      const foreignSubmissions = new Set<number>();
+      let runIsForeign = false;
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
@@ -1019,6 +1028,7 @@ export function makePiDurableAdapterV2(
           const status = recordString(record, "status");
           if (record === undefined || id === undefined) return;
           if (status !== "done" && status !== "unanswered") return;
+          if (foreignSubmissions.delete(id)) return;
           const turn = activeTurn;
           if (turn !== null && turn.submissions.has(id)) {
             turn.submissions.set(id, record);
@@ -1028,8 +1038,20 @@ export function makePiDurableAdapterV2(
           }
           return;
         }
+        if (type === "run_start") {
+          const inputs = recordField(event, "inputs");
+          runIsForeign =
+            Array.isArray(inputs) &&
+            inputs.length > 0 &&
+            inputs.every((input) => typeof input === "number" && foreignSubmissions.has(input));
+          return;
+        }
+        if (type === "run_end") {
+          runIsForeign = false;
+          return;
+        }
         const turn = activeTurn;
-        if (turn === null) return;
+        if (turn === null || runIsForeign) return;
         switch (type) {
           case "message_start": {
             const message = recordField(event, "message");
@@ -1216,6 +1238,25 @@ export function makePiDurableAdapterV2(
         const nextScope = yield* Scope.fork(scope);
         const queue = yield* worker.subscribe(id).pipe(Scope.provide(nextScope));
         const watched = yield* call("conversation.watch", { conversationId: id });
+        // Mark resumed work before the pump sees its first event.
+        const snapshot = recordField(watched, "snapshot");
+        const run = recordField(snapshot, "run");
+        const runInputs = recordField(run, "inputs");
+        const inbox = recordField(snapshot, "inbox");
+        foreignSubmissions.clear();
+        for (const input of Array.isArray(runInputs) ? runInputs : []) {
+          if (typeof input === "number") foreignSubmissions.add(input);
+        }
+        for (const item of Array.isArray(inbox) ? inbox : []) {
+          const queued = recordNumber(item, "id");
+          if (queued !== undefined) foreignSubmissions.add(queued);
+        }
+        // A rebind during this session's own turn keeps that turn's work.
+        for (const own of activeTurn?.submissions.keys() ?? []) foreignSubmissions.delete(own);
+        runIsForeign =
+          Array.isArray(runInputs) &&
+          runInputs.length > 0 &&
+          runInputs.every((input) => typeof input === "number" && foreignSubmissions.has(input));
         yield* pumpEvents(queue).pipe(Effect.forkIn(nextScope));
         yield* Scope.addFinalizer(
           nextScope,
@@ -1223,12 +1264,11 @@ export function makePiDurableAdapterV2(
         );
         watchScope = nextScope;
         conversationId = id;
-        const snapshot = recordField(watched, "snapshot");
-        if (recordField(snapshot, "run") !== undefined) {
-          // S01 observation point: the store holds work that was running when
-          // the previous owner stopped, and the new owner resumed it.
-          yield* Effect.logWarning("Pi-Durable conversation resumed with a run in progress", {
+        if (foreignSubmissions.size > 0) {
+          // The previous owner left work that the new owner resumed (S01-E05).
+          yield* Effect.logWarning("Pi-Durable conversation resumed work no T3 turn owns", {
             conversationId: id,
+            submissions: Array.from(foreignSubmissions),
           });
         }
       });

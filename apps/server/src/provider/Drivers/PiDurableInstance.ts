@@ -10,6 +10,7 @@ import {
   TextGenerationError,
   type PiDurableSettings,
   type PiSettings,
+  type RuntimeMode,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -66,9 +67,15 @@ type ProviderProbe = Parameters<typeof buildServerProvider>[0]["probe"];
  */
 export function durableProviderProbe(input: {
   readonly status: DurableWorkerStatus;
+  /** The worker's tool profile; `coding` mutates the workspace. */
+  readonly tools: string;
   readonly models: ReadonlyArray<DurableWorkerModel>;
   readonly defaultModel: { readonly provider: string; readonly modelId: string } | null;
-}): { readonly probe: ProviderProbe; readonly models: ServerProvider["models"] } {
+}): {
+  readonly probe: ProviderProbe;
+  readonly models: ServerProvider["models"];
+  readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode>;
+} {
   const enabled = input.status.scheduling === "enabled";
   const defaultModel =
     input.defaultModel === null
@@ -86,6 +93,11 @@ export function durableProviderProbe(input: {
   const capabilities = (model: DurableWorkerModel | undefined) =>
     thinkingCapabilitiesForPiModel(model, undefined);
   return {
+    // Nothing asks for approvals in the durable runtime yet, so a worker that
+    // can mutate the workspace runs only in Full access (the adapter refuses
+    // other modes); read-only and tool-free workers run in any mode.
+    supportedRuntimeModes:
+      input.tools === "coding" ? ["full-access"] : PRESENTATION.supportedRuntimeModes,
     probe: {
       installed: true,
       version: null,
@@ -146,11 +158,12 @@ export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
   const describe = (
     probe: Parameters<typeof buildServerProvider>[0]["probe"],
     models = [] as ServerProvider["models"],
+    supportedRuntimeModes: ReadonlyArray<RuntimeMode> = PRESENTATION.supportedRuntimeModes,
   ) =>
     Effect.map(DateTime.now, (now) =>
       stamp(
         buildServerProvider({
-          presentation: PRESENTATION,
+          presentation: { ...PRESENTATION, supportedRuntimeModes },
           enabled,
           checkedAt: DateTime.formatIso(now),
           models,
@@ -167,13 +180,16 @@ export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
             Effect.map((status) =>
               durableProviderProbe({
                 status,
+                tools: worker.tools,
                 models: worker.models,
                 defaultModel: worker.defaultModel,
               }),
             ),
           ),
         ),
-        Effect.flatMap(({ probe, models }) => describe(probe, models)),
+        Effect.flatMap(({ probe, models, supportedRuntimeModes }) =>
+          describe(probe, models, supportedRuntimeModes),
+        ),
         Effect.catch((error) =>
           describe({
             installed: false,

@@ -23,6 +23,7 @@ const enabled = { storeId: "store", ownerEpoch: 1, scheduling: "enabled", reason
 describe("durableProviderProbe", () => {
   it("leads the catalog with Pi's default, named after the model it resolves to", () => {
     const { probe, models: catalog } = durableProviderProbe({
+      tools: "read",
       status: enabled,
       models,
       defaultModel: { provider: "faux", modelId: "faux-2" },
@@ -40,6 +41,7 @@ describe("durableProviderProbe", () => {
 
   it("offers thinking levels for reasoning models, including through the default entry", () => {
     const { models: catalog } = durableProviderProbe({
+      tools: "read",
       status: enabled,
       models: [
         ...models,
@@ -76,8 +78,30 @@ describe("durableProviderProbe", () => {
     ]);
   });
 
+  it("advertises only Full access for a workspace-mutating worker", () => {
+    const read = durableProviderProbe({
+      tools: "read",
+      status: enabled,
+      models,
+      defaultModel: { provider: "faux", modelId: "faux-1" },
+    });
+    const coding = durableProviderProbe({
+      tools: "coding",
+      status: enabled,
+      models,
+      defaultModel: { provider: "faux", modelId: "faux-1" },
+    });
+    assert.deepStrictEqual(read.supportedRuntimeModes, [
+      "approval-required",
+      "auto-accept-edits",
+      "full-access",
+    ]);
+    assert.deepStrictEqual(coding.supportedRuntimeModes, ["full-access"]);
+  });
+
   it("omits the default entry when the worker has no model", () => {
     const { probe, models: catalog } = durableProviderProbe({
+      tools: "read",
       status: enabled,
       models: [],
       defaultModel: null,
@@ -88,6 +112,7 @@ describe("durableProviderProbe", () => {
 
   it("explains how to leave inspection without a running owner", () => {
     const { probe } = durableProviderProbe({
+      tools: "read",
       status: { ...enabled, scheduling: "inhibited", reasons: ["operator-requested"] },
       models,
       defaultModel: { provider: "faux", modelId: "faux-1" },
