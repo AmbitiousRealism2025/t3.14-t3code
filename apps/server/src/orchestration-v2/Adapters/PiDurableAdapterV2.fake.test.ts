@@ -548,6 +548,48 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("a Stop for a turn that already ended leaves the next turn running", () =>
+    Effect.gen(function* () {
+      let submits = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.submit": () => {
+          submits += 1;
+          return Effect.succeed({ submissionId: submits, status: "placed" });
+        },
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const first = yield* turnInput(providerThread);
+      yield* runtime.startTurn(first);
+      const firstRunning = yield* next(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      if (firstRunning.type !== "provider_turn.updated") return assert.fail("no running turn");
+      yield* fake.push(settled(1));
+      yield* next(isTerminal);
+      const second = yield* turnInput(providerThread);
+      yield* runtime.startTurn({
+        ...second,
+        runId: RunId.make(`run:${THREAD_ID}:2`),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+        attemptId: RunAttemptId.make(`run-attempt:run:${THREAD_ID}:2:1`),
+        message: { ...second.message, messageId: `message:${THREAD_ID}:2` as never },
+      });
+      // The late Stop still names the first turn.
+      yield* runtime.interruptTurn({
+        providerThread,
+        providerTurnId: firstRunning.providerTurn.id,
+        requestRuntimeRestart: true,
+      });
+      assert.isFalse(fake.requests.some((request) => request.method === "conversation.abort"));
+      yield* fake.push(settled(2));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({

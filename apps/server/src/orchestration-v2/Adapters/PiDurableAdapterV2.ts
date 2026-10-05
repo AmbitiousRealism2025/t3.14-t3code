@@ -1669,33 +1669,40 @@ export function makePiDurableAdapterV2(
             ),
           ),
         interruptTurn: (interruptInput) =>
-          Effect.gen(function* () {
-            const turn = activeTurn;
-            // Nothing of a settled turn is left to stop. A runtime restart is
-            // never needed: the durable store outlives this session.
-            if (turn === null && interruptInput.requestRuntimeRestart === true) return;
-            if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
-              return yield* protocolError(
-                `durable turn ${interruptInput.providerTurnId} is not active`,
-              );
-            }
-            // Under the permit, so an admission either sees the stop or re-aborts after it.
-            yield* permit.withPermits(1)(Effect.sync(() => (turn.interrupted = true)));
-            // Resolves once the conversation is idle; settlement events end the turn.
-            yield* call("conversation.abort", { conversationId }).pipe(
-              Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
-            );
-          }).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapter.ProviderAdapterInterruptError({
-                  driver: PI_PROVIDER,
-                  providerThreadId: interruptInput.providerThread.id,
-                  providerTurnId: interruptInput.providerTurnId,
-                  cause,
-                }),
+          // Find the turn, mark it stopped and abort in one permit section:
+          // no settlement or new turn can slip in, so a stale Stop never
+          // aborts the turn that follows. The worker's abort does not need
+          // this adapter's event pump, which resumes once the permit is free.
+          permit
+            .withPermits(1)(
+              Effect.gen(function* () {
+                const turn = activeTurn;
+                if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
+                  // Nothing of a settled turn is left to stop. A runtime restart
+                  // is never needed: the durable store outlives this session.
+                  if (interruptInput.requestRuntimeRestart === true) return;
+                  return yield* protocolError(
+                    `durable turn ${interruptInput.providerTurnId} is not active`,
+                  );
+                }
+                turn.interrupted = true;
+                // Resolves once the conversation is idle; settlement events end the turn.
+                yield* call("conversation.abort", { conversationId }).pipe(
+                  Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
+                );
+              }),
+            )
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterInterruptError({
+                    driver: PI_PROVIDER,
+                    providerThreadId: interruptInput.providerThread.id,
+                    providerTurnId: interruptInput.providerTurnId,
+                    cause,
+                  }),
+              ),
             ),
-          ),
         respondToRuntimeRequest: (requestInput) =>
           Effect.fail(
             new ProviderAdapter.ProviderAdapterRuntimeRequestResponseError({
