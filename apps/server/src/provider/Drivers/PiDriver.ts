@@ -5,6 +5,9 @@
  *
  * Pi state (sessions, settings, extensions, auth) lives in the user's own
  * `~/.pi/agent`, so continuation identity uses the default instance grouping.
+ *
+ * T3.14: an instance whose config carries `durable` runs on the box-side
+ * Pi-Durable worker instead (`PiDurableInstance`).
  */
 import { PiSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -36,6 +39,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { makePiDurableProviderInstance } from "./PiDurableInstance.ts";
 import {
   makeCachedProviderMaintenanceResolution,
   makePackageManagedProviderMaintenanceResolver,
@@ -91,8 +95,12 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
   },
   configSchema: PiSettings,
   defaultConfig: (): PiSettings => decodePiSettings({}),
-  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
+  create: (input) =>
     Effect.gen(function* () {
+      const { instanceId, displayName, accentColor, environment, enabled, config } = input;
+      if (config.durable !== undefined) {
+        return yield* makePiDurableProviderInstance(input, config.durable);
+      }
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const pathService = yield* Path.Path;
