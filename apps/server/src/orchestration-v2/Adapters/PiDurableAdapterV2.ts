@@ -479,6 +479,8 @@ interface ActiveDurableTurn {
   readonly tools: Map<string, ToolState>;
   /** Durable submission IDs this turn admitted; settled ones carry their record. */
   readonly submissions: Map<number, PiRpcRecord | null>;
+  /** Submit calls still in flight; the turn cannot end before they return. */
+  pendingAdmissions: number;
   interrupted: boolean;
   failure: ReturnType<typeof makeProviderFailure> | null;
   lastLiveUsedTokens: number | null;
@@ -967,6 +969,7 @@ export function makePiDurableAdapterV2(
       });
 
       const settleIfDone = (turn: ActiveDurableTurn) =>
+        turn.pendingAdmissions === 0 &&
         turn.submissions.size > 0 &&
         Array.from(turn.submissions.values()).every((record) => record !== null)
           ? finalizeTurn(turn)
@@ -1140,28 +1143,32 @@ export function makePiDurableAdapterV2(
           }
         }).pipe(
           Effect.catchCause((cause) =>
-            permit.withPermits(1)(
-              Effect.gen(function* () {
-                const turn = activeTurn;
-                if (turn !== null) {
-                  turn.failure = makeProviderFailure({
-                    cause,
-                    message: "The Pi-Durable worker stopped.",
-                    class: "transport_error",
-                  });
-                  yield* finalizeTurn(turn);
-                }
-                yield* updateProviderSession("error", "The Pi-Durable worker stopped.");
-                yield* Queue.fail(
-                  events,
-                  new ProviderAdapter.ProviderAdapterEventStreamError({
-                    driver: PI_PROVIDER,
-                    providerSessionId: input.providerSessionId,
-                    cause: Cause.squash(cause),
+            // Closing the watch scope on a rebind interrupts this pump on
+            // purpose; only a failure means the worker or watch is gone.
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : permit.withPermits(1)(
+                  Effect.gen(function* () {
+                    const turn = activeTurn;
+                    if (turn !== null) {
+                      turn.failure = makeProviderFailure({
+                        cause,
+                        message: "The Pi-Durable worker stopped.",
+                        class: "transport_error",
+                      });
+                      yield* finalizeTurn(turn);
+                    }
+                    yield* updateProviderSession("error", "The Pi-Durable worker stopped.");
+                    yield* Queue.fail(
+                      events,
+                      new ProviderAdapter.ProviderAdapterEventStreamError({
+                        driver: PI_PROVIDER,
+                        providerSessionId: input.providerSessionId,
+                        cause: Cause.squash(cause),
+                      }),
+                    );
                   }),
-                );
-              }),
-            ),
+                ),
           ),
         );
 
@@ -1296,28 +1303,49 @@ export function makePiDurableAdapterV2(
         if (thinking !== undefined) appliedThinking = thinking;
       });
 
+      /**
+       * Admit one input for `turn`. The admission is counted before the call,
+       * so a settlement that lands while it is in flight cannot end the turn
+       * and orphan the new submission's answer.
+       */
       const submit = Effect.fnUntraced(function* (
         turn: ActiveDurableTurn,
         message: ProviderAdapter.ProviderAdapterV2TurnMessage,
         whenBusy: "steer" | "followUp",
       ) {
-        const result = yield* call("conversation.submit", {
+        // The worker accepts text only; images and files are parity work (W07).
+        if (message.attachments.length > 0) {
+          return yield* protocolError(
+            "the durable runtime does not accept attachments yet; send the message without them",
+          );
+        }
+        yield* permit.withPermits(1)(Effect.sync(() => (turn.pendingAdmissions += 1)));
+        const admitted = yield* call("conversation.submit", {
           conversationId,
           requestId: `t3:${turn.turnInput.threadId}:${message.messageId}`,
           text: message.text,
           whenBusy,
-        });
-        const submissionId = recordNumber(result, "submissionId");
-        if (submissionId === undefined)
-          return yield* protocolError("worker returned no submission", result);
+        }).pipe(
+          Effect.flatMap((result) => {
+            const submissionId = recordNumber(result, "submissionId");
+            return submissionId === undefined
+              ? Effect.fail(protocolError("worker returned no submission", result))
+              : Effect.succeed(submissionId);
+          }),
+          Effect.exit,
+        );
         yield* permit.withPermits(1)(
           Effect.gen(function* () {
-            const early = earlySettlements.get(submissionId);
-            earlySettlements.delete(submissionId);
-            turn.submissions.set(submissionId, early ?? null);
-            if (early !== undefined) yield* settleIfDone(turn);
+            turn.pendingAdmissions -= 1;
+            if (admitted._tag === "Success") {
+              const early = earlySettlements.get(admitted.value);
+              earlySettlements.delete(admitted.value);
+              turn.submissions.set(admitted.value, early ?? null);
+            }
+            if (activeTurn === turn) yield* settleIfDone(turn);
           }),
         );
+        return yield* admitted;
       });
 
       yield* Effect.addFinalizer(() =>
@@ -1399,6 +1427,11 @@ export function makePiDurableAdapterV2(
                 "the durable runtime cannot ask for approvals yet; switch this thread to Full access or run the worker with a read-only tool profile",
               );
             }
+            if (turnInput.message.attachments.length > 0) {
+              return yield* protocolError(
+                "the durable runtime does not accept attachments yet; send the message without them",
+              );
+            }
             providerThread = turnInput.providerThread;
             yield* applySelection(turnInput.modelSelection);
             const startedAt = yield* DateTime.now;
@@ -1425,6 +1458,7 @@ export function makePiDurableAdapterV2(
               streamItems: new Map(),
               tools: new Map(),
               submissions: new Map(),
+              pendingAdmissions: 0,
               interrupted: false,
               failure: null,
               lastLiveUsedTokens: null,
@@ -1450,13 +1484,22 @@ export function makePiDurableAdapterV2(
             yield* submit(turn, turnInput.message, "followUp").pipe(
               Effect.tapError(() =>
                 permit.withPermits(1)(
-                  Effect.suspend(() => {
-                    if (activeTurn !== turn) return Effect.void;
+                  Effect.gen(function* () {
+                    if (activeTurn !== turn) return;
                     activeTurn = null;
-                    return Effect.all([
-                      updateProviderThread({ status: "idle" }),
-                      updateProviderSession("ready", null),
-                    ]);
+                    // The running update is already out; close it, not just the run.
+                    yield* emit({
+                      type: "provider_turn.updated",
+                      driver: PI_PROVIDER,
+                      threadId: turnInput.threadId,
+                      providerTurn: {
+                        ...turn.providerTurn,
+                        status: "failed",
+                        completedAt: yield* DateTime.now,
+                      },
+                    });
+                    yield* updateProviderThread({ status: "idle" });
+                    yield* updateProviderSession("ready", null);
                   }),
                 ),
               ),
