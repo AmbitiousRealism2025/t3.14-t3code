@@ -437,6 +437,35 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("a submit whose reply was lost is asked again and keeps its submission", () =>
+    Effect.gen(function* () {
+      let submits = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        // The first reply never arrives (the worker admitted it anyway); the
+        // same request ID then returns the original submission.
+        "conversation.submit": () => {
+          submits += 1;
+          return submits === 1
+            ? Effect.fail(
+                new PiDurableWorkerError({ detail: "Pi RPC conversation.submit timed out" }),
+              )
+            : Effect.succeed({ submissionId: 1, status: "placed" });
+        },
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn(yield* turnInput(providerThread));
+      const requestIds = fake.requests.flatMap((request) =>
+        request.method === "conversation.submit" ? [request.params["requestId"]] : [],
+      );
+      assert.lengthOf(requestIds, 2);
+      assert.strictEqual(requestIds[0], requestIds[1], "the retry reuses the request ID");
+      yield* fake.push(settled(1));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a rejected initial submission closes the running provider turn as failed", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeWorker({

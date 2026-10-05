@@ -544,19 +544,24 @@ export function makePiDurableAdapterV2(
             }),
         ),
       );
-      const call = (method: string, params?: PiRpcRecord) =>
-        worker
-          .request(method, params)
-          .pipe(
-            Effect.mapError((cause) =>
-              protocolError(
-                cause.errorName === "SchedulingInhibited"
-                  ? `the durable runtime is not scheduling work (${cause.detail}). ${DURABLE_INSPECTION_RELEASE_HINT}`
-                  : `worker ${method} failed: ${cause.detail}`,
-                cause.errorName === undefined ? undefined : { errorName: cause.errorName },
-              ),
+      const call = (method: string, params?: PiRpcRecord, retryUnanswered = false) =>
+        worker.request(method, params).pipe(
+          // An unanswered request (timeout, no worker reply) may still have
+          // landed. Requests whose replay is idempotent are asked again so
+          // the original outcome is recovered instead of dropped.
+          Effect.catchIf(
+            (cause) => retryUnanswered && cause.errorName === undefined && worker.isAlive(),
+            () => worker.request(method, params),
+          ),
+          Effect.mapError((cause) =>
+            protocolError(
+              cause.errorName === "SchedulingInhibited"
+                ? `the durable runtime is not scheduling work (${cause.detail}). ${DURABLE_INSPECTION_RELEASE_HINT}`
+                : `worker ${method} failed: ${cause.detail}`,
+              cause.errorName === undefined ? undefined : { errorName: cause.errorName },
             ),
-          );
+          ),
+        );
 
       const now = yield* DateTime.now;
       let sessionEntity: OrchestrationV2ProviderSession = {
@@ -1406,12 +1411,18 @@ export function makePiDurableAdapterV2(
               "the durable runtime does not accept attachments yet; send the message without them",
             );
           }
-          const result = yield* call("conversation.submit", {
-            conversationId,
-            requestId: `t3:${turn.turnInput.threadId}:${message.messageId}`,
-            text: message.text,
-            whenBusy,
-          });
+          // The request ID makes a repeated submit return the original
+          // submission, so a lost reply is recovered by asking again.
+          const result = yield* call(
+            "conversation.submit",
+            {
+              conversationId,
+              requestId: `t3:${turn.turnInput.threadId}:${message.messageId}`,
+              text: message.text,
+              whenBusy,
+            },
+            true,
+          );
           const submissionId = recordNumber(result, "submissionId");
           if (submissionId === undefined) {
             return yield* protocolError("worker returned no submission", result);
