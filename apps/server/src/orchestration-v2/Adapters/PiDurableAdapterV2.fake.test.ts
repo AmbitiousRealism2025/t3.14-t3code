@@ -76,11 +76,13 @@ const makeFakeWorker = (handlers: Record<string, Handler>) =>
           reasoning: false,
         },
       ],
-      request: (method, params = {}) => {
-        requests.push({ method, params });
-        const handler = handlers[method];
-        return handler === undefined ? Effect.succeed({}) : handler(params);
-      },
+      // Logged when the request runs, not when its effect is built.
+      request: (method, params = {}) =>
+        Effect.suspend(() => {
+          requests.push({ method, params });
+          const handler = handlers[method];
+          return handler === undefined ? Effect.succeed({}) : handler(params);
+        }),
       subscribe: () =>
         Effect.acquireRelease(
           Effect.gen(function* () {
@@ -463,6 +465,86 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       yield* fake.push(settled(1));
       const ended = yield* next(isTerminal);
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("Stop during an in-flight steer aborts the steer's submission too", () =>
+    Effect.gen(function* () {
+      const steerAnswer = yield* Deferred.make<unknown>();
+      const steerSent = yield* Deferred.make<void>();
+      let submits = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.submit": () => {
+          submits += 1;
+          return submits === 1
+            ? Effect.succeed({ submissionId: 1, status: "placed" })
+            : Deferred.succeed(steerSent, undefined).pipe(
+                Effect.andThen(Deferred.await(steerAnswer)),
+              );
+        },
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      yield* runtime.startTurn(input);
+      const running = yield* next(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      if (running.type !== "provider_turn.updated") return assert.fail("no running turn");
+      const steering = yield* runtime
+        .steerTurn({
+          threadId: THREAD_ID,
+          runId: input.runId,
+          providerThread,
+          providerTurnId: running.providerTurn.id,
+          message: { ...input.message, messageId: `message:${THREAD_ID}:2` as never },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(steerSent);
+      // Stop reaches the worker before the steer's submission exists.
+      yield* runtime.interruptTurn({ providerThread, providerTurnId: running.providerTurn.id });
+      yield* Deferred.succeed(steerAnswer, { submissionId: 2, status: "queued" });
+      yield* Fiber.join(steering);
+      const order = fake.requests.flatMap((request) =>
+        request.method === "conversation.submit" || request.method === "conversation.abort"
+          ? [request.method]
+          : [],
+      );
+      assert.deepStrictEqual(order, [
+        "conversation.submit",
+        "conversation.submit",
+        "conversation.abort",
+        "conversation.abort",
+      ]);
+      // A steer after Stop admits nothing.
+      const late = yield* runtime
+        .steerTurn({
+          threadId: THREAD_ID,
+          runId: input.runId,
+          providerThread,
+          providerTurnId: running.providerTurn.id,
+          message: { ...input.message, messageId: `message:${THREAD_ID}:3` as never },
+        })
+        .pipe(Effect.flip);
+      assert.strictEqual(late._tag, "ProviderAdapterSteerRunError");
+      assert.strictEqual(submits, 2);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("rebinding the watched conversation keeps its watch", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker(defaultHandlers);
+      const { runtime, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.resumeThread({ providerThread });
+      const watchCalls = fake.requests.filter(
+        (request) =>
+          request.method === "conversation.watch" || request.method === "conversation.unwatch",
+      );
+      assert.deepStrictEqual(
+        watchCalls.map((request) => request.method),
+        ["conversation.watch"],
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

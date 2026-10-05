@@ -1241,6 +1241,9 @@ export function makePiDurableAdapterV2(
       // ── threads ────────────────────────────────────────────
 
       const bindConversation = Effect.fnUntraced(function* (id: number) {
+        // Rebinding the conversation already watched keeps that watch: closing
+        // and reopening it would leave a gap in which a settlement is missed.
+        if (watchScope !== null && conversationId === id) return;
         if (watchScope !== null) {
           yield* Scope.close(watchScope, Exit.void);
           watchScope = null;
@@ -1274,6 +1277,17 @@ export function makePiDurableAdapterV2(
         );
         watchScope = nextScope;
         conversationId = id;
+        // Anything of the active turn that settled before this watch existed
+        // reaches no event pump; read its record directly.
+        const unsettled = Array.from(activeTurn?.submissions ?? []).flatMap(
+          ([submissionId, record]) => (record === null ? [submissionId] : []),
+        );
+        for (const submissionId of unsettled) {
+          const status = yield* call("submission.status", { submissionId });
+          yield* permit.withPermits(1)(
+            handleEvent({ type: "submission", record: recordField(status, "record") }),
+          );
+        }
         if (foreignSubmissions.size > 0) {
           // The previous owner left work that the new owner resumed (S01-E05).
           yield* Effect.logWarning("Pi-Durable conversation resumed work no T3 turn owns", {
@@ -1405,6 +1419,10 @@ export function makePiDurableAdapterV2(
         whenBusy: "steer" | "followUp",
       ) {
         const admitted = yield* Effect.gen(function* () {
+          // Stop and this check share the permit: a stopped turn admits nothing new.
+          if (yield* permit.withPermits(1)(Effect.sync(() => turn.interrupted))) {
+            return yield* protocolError("the turn was stopped before this message was admitted");
+          }
           // The worker accepts text only; images and files are parity work (W07).
           if (message.attachments.length > 0) {
             return yield* protocolError(
@@ -1442,6 +1460,11 @@ export function makePiDurableAdapterV2(
             if (activeTurn === turn) yield* settleIfDone(turn);
           }),
         );
+        // Stop landed while this submit was in flight: the abort may have
+        // reached the worker first, so abort again now that the input exists.
+        if (admitted._tag === "Success" && turn.interrupted) {
+          yield* call("conversation.abort", { conversationId }).pipe(Effect.ignore);
+        }
         return yield* admitted;
       });
 
@@ -1656,7 +1679,8 @@ export function makePiDurableAdapterV2(
                 `durable turn ${interruptInput.providerTurnId} is not active`,
               );
             }
-            turn.interrupted = true;
+            // Under the permit, so an admission either sees the stop or re-aborts after it.
+            yield* permit.withPermits(1)(Effect.sync(() => (turn.interrupted = true)));
             // Resolves once the conversation is idle; settlement events end the turn.
             yield* call("conversation.abort", { conversationId }).pipe(
               Effect.tapError(() => Effect.sync(() => (turn.interrupted = false))),
