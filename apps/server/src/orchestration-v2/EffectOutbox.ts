@@ -39,6 +39,11 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     type: Schema.Literal("provider-turn.start"),
     runId: RunId,
   }),
+  /** T3.14: adopt a run the durable worker kept running across a restart. */
+  Schema.Struct({
+    type: Schema.Literal("durable-run.reattach"),
+    runId: RunId,
+  }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),
     providerSessionId: ProviderSessionId,
@@ -107,6 +112,8 @@ export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.T
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
+  // Enqueued by startup recovery itself; the durable run outlives the process.
+  "durable-run.reattach",
   "provider-session.detach",
   "provider-thread.rollback",
   "checkpoint.capture",

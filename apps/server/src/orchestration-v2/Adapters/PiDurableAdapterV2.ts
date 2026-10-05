@@ -264,9 +264,16 @@ function parseWorkerStatus(record: unknown): DurableWorkerStatus {
   };
 }
 
+/** A conversation whose recovered work T3 reattaches instead of cancelling (W02). */
+export interface DurableKeptConversation {
+  readonly storeId: string;
+  readonly conversationId: number;
+}
+
 const makeDurableWorker = Effect.fnUntraced(function* (input: {
   readonly launch: PiDurableSettings;
   readonly env: NodeJS.ProcessEnv;
+  readonly keep: ReadonlyArray<DurableKeptConversation>;
 }) {
   const scope = yield* Effect.scope;
   const connection = yield* makePiRpcConnection({
@@ -351,14 +358,23 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
     timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
   ) =>
     connection.request({ ...params, type: method }, timeoutMs).pipe(Effect.mapError(workerFailure));
-  // A worker boots holding everything it recovered (D03). Stock T3 cancels
-  // unsettled runs when it restarts, so recovered durable work is aborted to
-  // match before any of it can run unseen; resuming it instead is W02.
+  // A worker boots holding everything it recovered (D03). T3 reattaches the
+  // runs startup recovery left running (W02); everything else T3 cancelled
+  // is aborted before any of it can run unseen.
+  const keep = input.keep.flatMap((kept) =>
+    kept.storeId === booted.storeId ? [kept.conversationId] : [],
+  );
   const status =
     booted.reasons.length === 1 && booted.reasons[0] === "reconciliation-pending"
-      ? yield* request("owner.reconcile", { policy: "abort-recovered" }).pipe(
+      ? yield* request(
+          "owner.reconcile",
+          keep.length === 0
+            ? { policy: "abort-recovered" }
+            : { policy: "keep-conversations", conversations: keep },
+        ).pipe(
           Effect.tap((result) =>
             Effect.logInfo("Pi-Durable worker reconciled recovered work", {
+              kept: keep,
               aborted: recordField(result, "aborted"),
             }),
           ),
@@ -396,13 +412,20 @@ const makeDurableWorker = Effect.fnUntraced(function* (input: {
 /**
  * One worker per adapter instance, created on first use and respawned after
  * it dies. Owner conflicts are retried for a short handover window.
+ *
+ * `keepConversations` resolves once startup recovery has decided which
+ * durable runs to reattach; the first worker waits for it and keeps their
+ * conversations' work. A respawned worker keeps nothing: the runs it would
+ * have served failed with the worker that died.
  */
 export const makeDurableWorkerManager = Effect.fnUntraced(function* (input: {
   readonly launch: PiDurableSettings;
   readonly env: NodeJS.ProcessEnv;
+  readonly keepConversations?: Effect.Effect<ReadonlyArray<DurableKeptConversation>>;
 }) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const permit = yield* Semaphore.make(1);
+  let keepConversations = input.keepConversations;
   let current: { readonly worker: DurableWorker; readonly scope: Scope.Closeable } | null = null;
   // Stopping a worker waits out PiRpc's termination grace in wall-clock time,
   // including under a test clock, so the instance closes it on the live clock.
@@ -426,9 +449,10 @@ export const makeDurableWorkerManager = Effect.fnUntraced(function* (input: {
         yield* Scope.close(current.scope, Exit.void).pipe(liveClock);
         current = null;
       }
+      const keep = keepConversations === undefined ? [] : yield* keepConversations;
       const attempt = Effect.gen(function* () {
         const workerScope = yield* Scope.make("sequential");
-        return yield* makeDurableWorker(input).pipe(
+        return yield* makeDurableWorker({ launch: input.launch, env: input.env, keep }).pipe(
           Scope.provide(workerScope),
           Effect.map((worker) => ({ worker, scope: workerScope })),
           Effect.tapError(() => Scope.close(workerScope, Exit.void).pipe(liveClock)),
@@ -444,6 +468,7 @@ export const makeDurableWorkerManager = Effect.fnUntraced(function* (input: {
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
       current = started;
+      keepConversations = undefined;
       yield* Effect.logInfo("Pi-Durable worker ready", {
         storeId: started.worker.status.storeId,
         ownerEpoch: started.worker.status.ownerEpoch,
@@ -613,6 +638,23 @@ export function makePiDurableAdapterV2(
        */
       const foreignSubmissions = new Set<number>();
       let runIsForeign = false;
+      /** Inputs of the run executing now, from the watch snapshot or `run_start`. */
+      let currentRunInputs: ReadonlyArray<number> = [];
+      const recomputeRunIsForeign = () => {
+        runIsForeign =
+          currentRunInputs.length > 0 &&
+          currentRunInputs.every((submissionId) => foreignSubmissions.has(submissionId));
+      };
+      /**
+       * The watch snapshot and the output of foreign runs since it was taken.
+       * A reattached turn (W02) adopts its run from both: the snapshot holds
+       * what the run wrote before this session watched, the backlog the rest.
+       */
+      let boundSnapshot: unknown = undefined;
+      let foreignBacklog: Array<{
+        readonly runInputs: ReadonlyArray<number>;
+        readonly event: PiRpcRecord;
+      }> = [];
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
@@ -1065,18 +1107,32 @@ export function makePiDurableAdapterV2(
         }
         if (type === "run_start") {
           const inputs = recordField(event, "inputs");
-          runIsForeign =
-            Array.isArray(inputs) &&
-            inputs.length > 0 &&
-            inputs.every((input) => typeof input === "number" && foreignSubmissions.has(input));
+          currentRunInputs = Array.isArray(inputs)
+            ? inputs.filter((input): input is number => typeof input === "number")
+            : [];
+          recomputeRunIsForeign();
           return;
         }
         if (type === "run_end") {
+          currentRunInputs = [];
           runIsForeign = false;
           return;
         }
+        if (runIsForeign) {
+          foreignBacklog.push({ runInputs: currentRunInputs, event });
+          return;
+        }
         const turn = activeTurn;
-        if (turn === null || runIsForeign) return;
+        if (turn === null) return;
+        yield* handleOutput(turn, event);
+      });
+
+      /** Maps one output event of the run that `turn` owns. */
+      const handleOutput = Effect.fnUntraced(function* (
+        turn: ActiveDurableTurn,
+        event: PiRpcRecord,
+      ) {
+        const type = recordString(event, "type");
         switch (type) {
           case "message_start": {
             const message = recordField(event, "message");
@@ -1272,19 +1328,19 @@ export function makePiDurableAdapterV2(
         const runInputs = recordField(run, "inputs");
         const inbox = recordField(snapshot, "inbox");
         foreignSubmissions.clear();
-        for (const input of Array.isArray(runInputs) ? runInputs : []) {
-          if (typeof input === "number") foreignSubmissions.add(input);
-        }
+        currentRunInputs = Array.isArray(runInputs)
+          ? runInputs.filter((input): input is number => typeof input === "number")
+          : [];
+        for (const input of currentRunInputs) foreignSubmissions.add(input);
         for (const item of Array.isArray(inbox) ? inbox : []) {
           const queued = recordNumber(item, "id");
           if (queued !== undefined) foreignSubmissions.add(queued);
         }
         // A rebind during this session's own turn keeps that turn's work.
         for (const own of activeTurn?.submissions.keys() ?? []) foreignSubmissions.delete(own);
-        runIsForeign =
-          Array.isArray(runInputs) &&
-          runInputs.length > 0 &&
-          runInputs.every((input) => typeof input === "number" && foreignSubmissions.has(input));
+        recomputeRunIsForeign();
+        boundSnapshot = snapshot;
+        foreignBacklog = [];
         yield* pumpEvents(queue).pipe(Effect.forkIn(nextScope));
         yield* Scope.addFinalizer(
           nextScope,
@@ -1423,6 +1479,104 @@ export function makePiDurableAdapterV2(
       });
 
       /**
+       * Projects the run a reattached turn adopts (W02): what it wrote before
+       * this session watched, from the watch snapshot, then its output since,
+       * from the backlog. Item IDs follow the same order as live mapping, so
+       * items already projected before the restart are updated, not repeated.
+       */
+      const adoptRun = Effect.fnUntraced(function* (
+        turn: ActiveDurableTurn,
+        submissionId: number,
+        record: unknown,
+      ) {
+        const startedAt = yield* DateTime.now;
+        const calls = new Map<string, { readonly name: string; readonly args: unknown }>();
+        const noteCalls = (content: unknown) => {
+          for (const block of Array.isArray(content) ? content : []) {
+            const id = recordString(block, "id");
+            if (recordString(block, "type") === "toolCall" && id !== undefined) {
+              calls.set(id, {
+                name: recordString(block, "name") ?? "tool",
+                args: recordField(block, "arguments"),
+              });
+            }
+          }
+        };
+        const userEntry = recordNumber(record, "entry");
+        const entries = recordField(boundSnapshot, "entries");
+        for (const entry of Array.isArray(entries) ? entries : []) {
+          const entryId = recordNumber(entry, "id");
+          if (userEntry === undefined || entryId === undefined || entryId <= userEntry) continue;
+          const message = (recordField(entry, "model") as unknown[] | undefined)?.[0];
+          const role = recordString(message, "role");
+          const content = recordField(message, "content");
+          if (role === "assistant") {
+            turn.messageOrdinal += 1;
+            noteCalls(content);
+            for (const [index, block] of (Array.isArray(content) ? content : []).entries()) {
+              const parsed = blockText(block);
+              if (parsed === null) continue;
+              const item = yield* streamItem(turn, parsed.kind, index);
+              item.text = parsed.text;
+            }
+            yield* completeStreamItems(turn);
+            if (recordString(message, "stopReason") === "error") {
+              turn.failure = makeProviderFailure({
+                message: recordString(message, "errorMessage") ?? "The model returned an error.",
+              });
+            }
+          } else if (role === "toolResult") {
+            const callId = recordString(message, "toolCallId") ?? "";
+            const call = calls.get(callId);
+            const output = contentText(content);
+            yield* emitTool(
+              turn,
+              {
+                nativeItemId: `${turn.providerTurn.id}:tool:${callId}`,
+                toolName: call?.name ?? recordString(message, "toolName") ?? "tool",
+                args: call?.args,
+                output,
+                startedAt,
+              },
+              recordField(message, "isError") === true ? "failed" : "completed",
+            );
+          }
+        }
+        // The answer and tools in flight when the snapshot was taken.
+        const snapshotRun = recordField(recordField(boundSnapshot, "run"), "inputs");
+        if (Array.isArray(snapshotRun) && snapshotRun.includes(submissionId)) {
+          const partial = recordField(recordField(boundSnapshot, "generation"), "message");
+          if (recordString(partial, "role") === "assistant") {
+            turn.messageOrdinal += 1;
+            const content = recordField(partial, "content");
+            noteCalls(content);
+            for (const [index, block] of (Array.isArray(content) ? content : []).entries()) {
+              yield* setBlockText(turn, index, block);
+            }
+          }
+          const slots = recordField(boundSnapshot, "tools");
+          for (const slot of Array.isArray(slots) ? slots : []) {
+            const callId = recordString(slot, "callId");
+            if (callId === undefined || recordString(slot, "status") === "done") continue;
+            const tool: ToolState = {
+              nativeItemId: `${turn.providerTurn.id}:tool:${callId}`,
+              toolName: recordString(slot, "name") ?? "tool",
+              args: calls.get(callId)?.args,
+              output: recordString(slot, "output") ?? "",
+              startedAt,
+            };
+            turn.tools.set(callId, tool);
+            yield* emitTool(turn, tool, "running");
+          }
+        }
+        const backlog = foreignBacklog;
+        foreignBacklog = [];
+        for (const { runInputs, event } of backlog) {
+          if (runInputs.includes(submissionId)) yield* handleOutput(turn, event);
+        }
+      });
+
+      /**
        * Admit one input for `turn`, whose admission the caller reserved under
        * `permit` in the same critical section that found the turn active. The
        * turn cannot end while a reservation is open, so a settlement that lands
@@ -1432,6 +1586,7 @@ export function makePiDurableAdapterV2(
         turn: ActiveDurableTurn,
         message: ProviderAdapter.ProviderAdapterV2TurnMessage,
         whenBusy: "steer" | "followUp",
+        adopt = false,
       ) {
         const admitted = yield* Effect.gen(function* () {
           // Stop and this check share the permit: a stopped turn admits nothing new.
@@ -1460,17 +1615,29 @@ export function makePiDurableAdapterV2(
           if (submissionId === undefined) {
             return yield* protocolError("worker returned no submission", result);
           }
-          return submissionId;
+          // An adopted submission may have settled before this session
+          // watched; its record also names the input's transcript entry.
+          const record = adopt
+            ? recordField(yield* call("submission.status", { submissionId }), "record")
+            : undefined;
+          return { submissionId, record };
         }).pipe(Effect.exit);
         yield* permit.withPermits(1)(
           Effect.gen(function* () {
             turn.pendingAdmissions -= 1;
             if (admitted._tag === "Success") {
-              // A rebind during the call can have seen this ID as foreign.
-              foreignSubmissions.delete(admitted.value);
-              const early = earlySettlements.get(admitted.value);
-              earlySettlements.delete(admitted.value);
-              turn.submissions.set(admitted.value, early ?? null);
+              const { submissionId, record } = admitted.value;
+              // A rebind during the call can have seen this ID as foreign, and
+              // an adopted submission was: its run is this turn's now.
+              foreignSubmissions.delete(submissionId);
+              recomputeRunIsForeign();
+              const early = earlySettlements.get(submissionId);
+              earlySettlements.delete(submissionId);
+              const status = recordString(record, "status");
+              const settled =
+                status === "done" || status === "unanswered" ? (record as PiRpcRecord) : null;
+              turn.submissions.set(submissionId, early ?? settled);
+              if (adopt) yield* adoptRun(turn, submissionId, record);
             }
             if (activeTurn === turn) yield* settleIfDone(turn);
           }),
@@ -1480,7 +1647,7 @@ export function makePiDurableAdapterV2(
         if (admitted._tag === "Success" && turn.interrupted) {
           yield* call("conversation.abort", { conversationId }).pipe(Effect.ignore);
         }
-        return yield* admitted;
+        return (yield* admitted).submissionId;
       });
 
       yield* Effect.addFinalizer(() =>
@@ -1568,7 +1735,15 @@ export function makePiDurableAdapterV2(
               );
             }
             providerThread = turnInput.providerThread;
-            yield* applySelection(turnInput.modelSelection);
+            const adopt = turnInput.reattach === true;
+            if (adopt) {
+              // The run already executes with the selection it started with.
+              appliedModel = resolveSlug(turnInput.modelSelection.model);
+              appliedThinking =
+                getModelSelectionStringOptionValue(turnInput.modelSelection, "thinking") ?? null;
+            } else {
+              yield* applySelection(turnInput.modelSelection);
+            }
             const startedAt = yield* DateTime.now;
             const syntheticNativeTurnId = `${providerThread.id}:attempt:${turnInput.attemptId}`;
             const turn: ActiveDurableTurn = {
@@ -1603,6 +1778,8 @@ export function makePiDurableAdapterV2(
               Effect.gen(function* () {
                 activeTurn = turn;
                 turn.pendingAdmissions = 1;
+                // Only a reattached turn adopts output from before it started.
+                if (!adopt) foreignBacklog = [];
                 yield* emit({
                   type: "provider_turn.updated",
                   driver: PI_PROVIDER,
@@ -1617,7 +1794,9 @@ export function makePiDurableAdapterV2(
                 yield* updateProviderSession("running", null);
               }),
             );
-            yield* admitReserved(turn, turnInput.message, "followUp").pipe(
+            // A reattached turn resubmits its original request ID, which
+            // returns the submission admitted before the restart.
+            yield* admitReserved(turn, turnInput.message, "followUp", adopt).pipe(
               Effect.tapError(() =>
                 permit.withPermits(1)(
                   Effect.gen(function* () {

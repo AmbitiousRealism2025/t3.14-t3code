@@ -162,6 +162,19 @@ export const executorLayer: Layer.Layer<
                     }),
                 ),
               );
+          case "durable-run.reattach":
+            return providerTurnStart
+              .reattach({ threadId: effect.threadId, runId: effect.request.runId, willRetry })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-turn.interrupt":
             return providerTurnControl
               .interrupt({

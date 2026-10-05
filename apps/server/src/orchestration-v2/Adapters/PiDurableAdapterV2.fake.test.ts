@@ -1,7 +1,7 @@
 /**
  * PiDurableAdapterV2 against a scripted in-process worker, for orderings a
  * real worker cannot produce on demand: settlement racing a steer, rejected
- * admission, attachments and thread rebinding.
+ * admission, attachments, thread rebinding and reattaching after a restart.
  */
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -104,7 +104,18 @@ const makeFakeWorker = (handlers: Record<string, Handler>) =>
         (queue) => Queue.offer(queue, { type: "events", conversationId: CONVERSATION_ID, events }),
         { discard: true },
       );
-    return { worker, push, requests, subscriberCount: () => subscribers.length };
+    /**
+     * Resolves once the adapter has taken every pushed batch. While nothing
+     * holds the adapter's permit it handles a batch as soon as it takes it.
+     */
+    const drained: Effect.Effect<void> = Effect.gen(function* () {
+      while (true) {
+        const sizes = yield* Effect.forEach(subscribers, (queue) => Queue.size(queue));
+        if (sizes.every((size) => size === 0)) return;
+        yield* Effect.yieldNow;
+      }
+    });
+    return { worker, push, drained, requests, subscriberCount: () => subscribers.length };
   });
 
 const defaultHandlers: Record<string, Handler> = {
@@ -689,6 +700,179 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
           (event) =>
             event.type === "provider_session.updated" && event.providerSession.status === "error",
         ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a reattached turn adopts its running submission and the output so far", () =>
+    Effect.gen(function* () {
+      const statusAsked = yield* Deferred.make<void>();
+      const adopt = yield* Deferred.make<void>();
+      let submits = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        // Submission 5 (entry 10) ran before the restart: one answer with a
+        // tool call, its result, and a second answer still streaming.
+        "conversation.watch": () =>
+          Effect.succeed({
+            snapshot: {
+              entries: [
+                { id: 10, model: [{ role: "user", content: "hello" }] },
+                {
+                  id: 11,
+                  model: [
+                    {
+                      role: "assistant",
+                      content: [
+                        { type: "text", text: "Reading it." },
+                        { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a" } },
+                      ],
+                    },
+                  ],
+                },
+                {
+                  id: 12,
+                  model: [
+                    {
+                      role: "toolResult",
+                      toolCallId: "call-1",
+                      toolName: "read",
+                      content: [{ type: "text", text: "file body" }],
+                      isError: false,
+                    },
+                  ],
+                },
+              ],
+              run: { inputs: [5] },
+              generation: {
+                attempt: 1,
+                message: { role: "assistant", content: [{ type: "text", text: "The file" }] },
+              },
+              tools: [],
+              inbox: [],
+            },
+          }),
+        "conversation.submit": () => {
+          submits += 1;
+          return Effect.succeed(
+            submits === 1
+              ? { submissionId: 5, status: "placed" }
+              : { submissionId: 6, status: "queued" },
+          );
+        },
+        "submission.status": () =>
+          Deferred.succeed(statusAsked, undefined).pipe(
+            Effect.andThen(Deferred.await(adopt)),
+            Effect.as({ record: { id: 5, status: "placed", entry: 10 } }),
+          ),
+      });
+      const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      const starting = yield* runtime
+        .startTurn({ ...input, reattach: true })
+        .pipe(Effect.forkScoped);
+      // The run streams more before the turn has adopted it.
+      yield* Deferred.await(statusAsked);
+      yield* fake.push({
+        type: "message_update",
+        changes: [{ type: "text_delta", contentIndex: 0, delta: " says" }],
+      });
+      yield* fake.drained;
+      yield* Deferred.succeed(adopt, undefined);
+      yield* Fiber.join(starting);
+      yield* fake.push(
+        {
+          type: "message_update",
+          changes: [{ type: "text_delta", contentIndex: 0, delta: " hi" }],
+        },
+        marker("adopted"),
+      );
+      yield* next(isMarker("adopted"));
+      const running = seen.find(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      if (running?.type !== "provider_turn.updated") return assert.fail("no running turn");
+      // The run is the turn's own now, so a message steers it.
+      yield* runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: input.runId,
+        providerThread,
+        providerTurnId: running.providerTurn.id,
+        message: { ...input.message, messageId: `message:${THREAD_ID}:2` as never },
+      });
+      yield* fake.push(settled(5), settled(6));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+
+      const submitted = fake.requests.flatMap((request) =>
+        request.method === "conversation.submit" ? [request.params] : [],
+      );
+      assert.deepStrictEqual(
+        submitted.map((params) => [params["requestId"], params["whenBusy"]]),
+        [
+          [`t3:${THREAD_ID}:message:${THREAD_ID}:1`, "followUp"],
+          [`t3:${THREAD_ID}:message:${THREAD_ID}:2`, "steer"],
+        ],
+      );
+      assert.isFalse(
+        fake.requests.some((request) => request.method === "conversation.configure"),
+        "the run keeps the selection it started with",
+      );
+      const messages = new Map<string, string>();
+      const tools = new Map<string, string>();
+      for (const event of seen) {
+        if (event.type === "message.updated") messages.set(event.message.id, event.message.text);
+        if (event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool") {
+          tools.set(event.turnItem.id, `${event.turnItem.status}:${event.turnItem.output ?? ""}`);
+        }
+      }
+      assert.deepStrictEqual(Array.from(messages.values()), [
+        "Reading it.",
+        "The file says hi",
+        "adopted",
+      ]);
+      assert.deepStrictEqual(Array.from(tools.values()), ["completed:file body"]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a reattached submission that settled before the watch ends the turn at once", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () =>
+          Effect.succeed({
+            snapshot: {
+              entries: [
+                { id: 10, model: [{ role: "user", content: "hello" }] },
+                {
+                  id: 11,
+                  model: [
+                    {
+                      role: "assistant",
+                      content: [{ type: "text", text: "the answer" }],
+                      stopReason: "stop",
+                    },
+                  ],
+                },
+              ],
+              tools: [],
+              inbox: [],
+            },
+          }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 5, status: "done" }),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 5, status: "done", entry: 10, answer: 11 } }),
+      });
+      const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn({ ...(yield* turnInput(providerThread)), reattach: true });
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+      assert.deepStrictEqual(
+        seen.flatMap((event) =>
+          event.type === "message.updated" && !event.message.streaming ? [event.message.text] : [],
+        ),
+        ["the answer"],
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );

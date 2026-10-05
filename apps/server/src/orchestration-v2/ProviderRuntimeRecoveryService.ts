@@ -14,8 +14,10 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import * as DurableReattach from "./DurableReattach.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "./IdAllocator.ts";
@@ -176,6 +178,11 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  // T3.14: present when this server can reattach durable runs (W02).
+  const reattachPlan = yield* Effect.serviceOption(DurableReattach.DurableReattachPlan);
+  const durableBoundRuns = (projection: ProjectionStore.ProjectionRuntimeRecoveryState) =>
+    Option.isSome(reattachPlan) ? DurableReattach.durableBoundRuns(projection) : [];
+  const startupReattached: Array<DurableReattach.DurableReattachPlanEntry> = [];
   const reconcileProjection = Effect.fn("ProviderRuntimeRecoveryService.reconcileProjection")(
     function* (
       projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -183,8 +190,20 @@ export const make = Effect.gen(function* () {
       continueAfterRestart: boolean,
     ) {
       const now = yield* DateTime.now;
+      // The durable worker keeps these runs going across the restart: they
+      // are left running, with their items and provider thread, and startup
+      // reattaches them. Shutdown leaves them too, or startup would find them
+      // already cancelled.
+      const reattached = durableBoundRuns(projection);
+      const reattachedRunIds = new Set(reattached.map(({ run }) => run.id));
+      const reattachedProviderThreadIds = new Set(
+        reattached.flatMap(({ run }) =>
+          run.providerThreadId === null ? [] : [run.providerThreadId],
+        ),
+      );
       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
+        if (reattachedRunIds.has(run.id)) continue;
         if (run.status === "waiting") {
           const checkpointEffects = yield* outbox
             .listByCommandId(CommandId.make(`command:effect:checkpoint.capture:${run.id}`))
@@ -437,7 +456,10 @@ export const make = Effect.gen(function* () {
       const recoveredNonterminalRunIds = new Set(runs.map((run) => run.id));
       const cancelledStaleNodeIds = new Set<string>();
       for (const item of projection.turnItems ?? []) {
-        if (item.runId !== null && recoveredNonterminalRunIds.has(item.runId)) {
+        if (
+          item.runId !== null &&
+          (recoveredNonterminalRunIds.has(item.runId) || reattachedRunIds.has(item.runId))
+        ) {
           continue;
         }
         if (!isBackgroundCapableTurnItemType(item.type)) {
@@ -578,6 +600,7 @@ export const make = Effect.gen(function* () {
       // persisted Waiting roster (including idle threads from settled roots)
       // and idle active threads without resurrecting active status.
       for (const providerThread of projection.providerThreads ?? []) {
+        if (reattachedProviderThreadIds.has(providerThread.id)) continue;
         const needsIdle = providerThread.status === "active";
         const needsRosterClear = providerThreadHasPendingBackgroundTasks(providerThread);
         if (!needsIdle && !needsRosterClear) {
@@ -639,20 +662,57 @@ export const make = Effect.gen(function* () {
           },
         });
       }
-      const continuationRun =
+      const continuationCandidate =
         continueAfterRestart && trigger === "startup"
           ? restartContinuationRun(projection)
           : undefined;
-      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
-        ? [
-            {
-              id: `effect:restart-continuation:${continuationRun.id}`,
+      const continuationRun =
+        continuationCandidate !== undefined && reattachedRunIds.has(continuationCandidate.id)
+          ? undefined
+          : continuationCandidate;
+      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = [
+        ...(continuationRun
+          ? [
+              {
+                id: `effect:restart-continuation:${continuationRun.id}`,
+                commandId,
+                threadId: projection.thread.id,
+                request: {
+                  type: "provider-runtime.continue" as const,
+                  sourceRunId: continuationRun.id,
+                },
+              },
+            ]
+          : []),
+        ...(trigger === "startup"
+          ? reattached.map(({ run, attemptId }) => ({
+              id: DurableReattach.durableReattachEffectId(run.id, attemptId, now),
               commandId,
               threadId: projection.thread.id,
-              request: { type: "provider-runtime.continue", sourceRunId: continuationRun.id },
-            },
-          ]
-        : [];
+              request: { type: "durable-run.reattach" as const, runId: run.id },
+            }))
+          : []),
+      ];
+      if (trigger === "startup" && reattached.length > 0) {
+        // A reattach an earlier startup left unsettled would adopt the run twice.
+        const superseded = yield* outbox
+          .cancelUnsettled({
+            threadId: projection.thread.id,
+            effectTypes: ["durable-run.reattach"],
+            reason: "Superseded by the reattach of a later startup.",
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "reconcile",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
+        yield* outbox.signalCancellations(superseded);
+      }
       const stoppedSessions = projection.providerSessions.filter(
         (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
       ).length;
@@ -676,6 +736,19 @@ export const make = Effect.gen(function* () {
           );
         yield* outbox.signalCancellations(retiredEffectIds);
         retiredEffects = retiredEffectIds.length;
+        // A thread whose only live work is a reattached run has no events to commit.
+        if (effects.length > 0) {
+          yield* eventSink.writeWithEffects({ commandId, events: [], effects }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "reconcile",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
+        }
       } else {
         const result = yield* eventSink
           .commitCommand({
@@ -707,6 +780,7 @@ export const make = Effect.gen(function* () {
         stoppedSessions,
         closedRequests: requests.length,
         retiredEffects,
+        reattached,
       };
     },
   );
@@ -747,6 +821,11 @@ export const make = Effect.gen(function* () {
         stoppedSessions += result.stoppedSessions;
         closedRequests += result.closedRequests;
         retiredEffects += result.retiredEffects;
+        if (trigger === "startup") {
+          for (const { run, conversation } of result.reattached) {
+            startupReattached.push({ instanceId: run.providerInstanceId, conversation });
+          }
+        }
       }
       const outboxReconciliation = yield* outbox.reconcileAfterProcessLoss.pipe(
         Effect.mapError(
@@ -779,6 +858,8 @@ export const make = Effect.gen(function* () {
           return;
         const run = restartContinuationRun(projection);
         if (!run) return;
+        // A durable run continues by reattaching, not by a new run.
+        if (durableBoundRuns(projection).some((bound) => bound.run.id === run.id)) return;
         const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
         yield* eventSink.writeWithEffects({
           commandId,
@@ -807,7 +888,15 @@ export const make = Effect.gen(function* () {
 
   const recover = Effect.gen(function* () {
     return (yield* reconcile("startup")) satisfies ProviderRuntimeRecoverySummary;
-  });
+  }).pipe(
+    // Durable workers wait for the plan. Completing it even when recovery
+    // fails lets them start; a run left out of it is aborted by its worker.
+    Effect.ensuring(
+      Effect.suspend(() =>
+        Option.isSome(reattachPlan) ? reattachPlan.value.complete(startupReattached) : Effect.void,
+      ),
+    ),
+  );
 
   return ProviderRuntimeRecoveryService.of({ reconcile, prepareForShutdown, recover });
 });
