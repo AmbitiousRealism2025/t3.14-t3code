@@ -66,7 +66,8 @@ import {
 import { PI_PROVIDER } from "./PiAdapterV2.ts";
 
 /** Durable worker wire protocol version this adapter speaks. */
-const DURABLE_WORKER_PROTOCOL = 1;
+// 2: the worker boots holding recovered work until `owner.reconcile` (D03).
+const DURABLE_WORKER_PROTOCOL = 2;
 const WORKER_READY_TIMEOUT = Duration.seconds(30);
 /** How long a new worker waits for a previous owner to release the store. */
 const OWNER_HANDOVER_WINDOW = Duration.seconds(15);
