@@ -129,16 +129,27 @@ const openRuntime = Effect.fnUntraced(function* (worker: DurableWorker, model = 
     runtimePolicy: policy,
   });
   const seen: ProviderAdapterV2Event[] = [];
+  const emitted = yield* Queue.unbounded<ProviderAdapterV2Event>();
   yield* runtime.events.pipe(
-    Stream.runForEach((event) => Effect.sync(() => seen.push(event))),
+    Stream.runForEach((event) =>
+      Effect.sync(() => seen.push(event)).pipe(Effect.andThen(Queue.offer(emitted, event))),
+    ),
     Effect.forkScoped,
   );
+  /** The next emitted event matching `predicate`; the deadline only reports a hang. */
+  const next = (predicate: (event: ProviderAdapterV2Event) => boolean) =>
+    Effect.gen(function* () {
+      while (true) {
+        const event = yield* Queue.take(emitted);
+        if (predicate(event)) return event;
+      }
+    }).pipe(Effect.timeout("10 seconds"));
   const providerThread = yield* runtime.ensureThread({
     threadId: THREAD_ID,
     modelSelection: { instanceId: INSTANCE_ID, model },
     runtimePolicy: policy,
   });
-  return { runtime, seen, providerThread };
+  return { runtime, seen, next, providerThread };
 });
 
 const turnInput = Effect.fnUntraced(function* (
@@ -195,23 +206,21 @@ const settled = (id: number) => ({
   record: { id, status: "done", answer: id * 10 },
 });
 
-/** Let forked fibers and queued events run. */
-const settle = Effect.sleep("20 millis");
+const isTerminal = (event: ProviderAdapterV2Event) => event.type === "turn.terminal";
 
-const terminals = (seen: ReadonlyArray<ProviderAdapterV2Event>) =>
-  seen.filter((event) => event.type === "turn.terminal");
-
-const runningTurnId = (seen: ReadonlyArray<ProviderAdapterV2Event>) => {
-  const running = seen.find(
-    (event) => event.type === "provider_turn.updated" && event.providerTurn.status === "running",
-  );
-  return running?.type === "provider_turn.updated" ? running.providerTurn.id : undefined;
-};
+/** An assistant partial: observable output only while the turn is still active. */
+const marker = (text: string) => ({
+  type: "message_start",
+  message: { role: "assistant", content: [{ type: "text", text }] },
+});
+const isMarker = (text: string) => (event: ProviderAdapterV2Event) =>
+  event.type === "message.updated" && event.message.text === text;
 
 describe("PiDurableAdapterV2 (scripted worker)", () => {
   it.live("a steer admitted while the first submission settles keeps the turn open", () =>
     Effect.gen(function* () {
       const steerAnswer = yield* Deferred.make<unknown>();
+      const steerSent = yield* Deferred.make<void>();
       let submits = 0;
       const fake = yield* makeFakeWorker({
         ...defaultHandlers,
@@ -219,41 +228,51 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
           submits += 1;
           return submits === 1
             ? Effect.succeed({ submissionId: 1, status: "placed" })
-            : Deferred.await(steerAnswer);
+            : Deferred.succeed(steerSent, undefined).pipe(
+                Effect.andThen(Deferred.await(steerAnswer)),
+              );
         },
       });
-      const { runtime, seen, providerThread } = yield* openRuntime(fake.worker);
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
       const input = yield* turnInput(providerThread);
       yield* runtime.startTurn(input);
-      yield* settle;
-      const providerTurnId = runningTurnId(seen);
-      assert.isDefined(providerTurnId);
+      const running = yield* next(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      );
+      assert.isTrue(running.type === "provider_turn.updated");
+      if (running.type !== "provider_turn.updated") return;
       const steering = yield* runtime
         .steerTurn({
           threadId: THREAD_ID,
           runId: input.runId,
           providerThread,
-          providerTurnId: providerTurnId!,
+          providerTurnId: running.providerTurn.id,
           message: { ...input.message, messageId: `message:${THREAD_ID}:2` as never },
         })
         .pipe(Effect.forkScoped);
-      yield* settle;
+      yield* Deferred.await(steerSent);
 
       // The first submission settles while the steer RPC is still in flight.
-      yield* fake.push(settled(1));
-      yield* settle;
-      assert.lengthOf(terminals(seen), 0, "the turn must wait for the steer's admission");
+      // Events in a batch are handled in order, so the marker shows whether the
+      // turn was still active after the settlement.
+      yield* fake.push(settled(1), marker("after settlement"));
+      const first = yield* next(
+        (event) => isTerminal(event) || isMarker("after settlement")(event),
+      );
+      assert.isFalse(isTerminal(first), "the turn must wait for the steer's admission");
 
       yield* Deferred.succeed(steerAnswer, { submissionId: 2, status: "queued" });
       yield* Fiber.join(steering);
-      yield* settle;
-      assert.lengthOf(terminals(seen), 0, "the steer's submission is still unsettled");
+      yield* fake.push(marker("after admission"));
+      const second = yield* next(
+        (event) => isTerminal(event) || isMarker("after admission")(event),
+      );
+      assert.isFalse(isTerminal(second), "the steer's submission is still unsettled");
 
       yield* fake.push(settled(2));
-      yield* settle;
-      const ended = terminals(seen);
-      assert.lengthOf(ended, 1);
-      assert.isTrue(ended[0]?.type === "turn.terminal" && ended[0].status === "completed");
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -269,14 +288,18 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
             }),
           ),
       });
-      const { runtime, seen, providerThread } = yield* openRuntime(fake.worker);
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
       const error = yield* runtime.startTurn(yield* turnInput(providerThread)).pipe(Effect.flip);
       assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
-      yield* settle;
-      const turnUpdates = seen.flatMap((event) =>
-        event.type === "provider_turn.updated" ? [event.providerTurn.status] : [],
+      const isTurnUpdate = (event: ProviderAdapterV2Event) =>
+        event.type === "provider_turn.updated";
+      const updates = [yield* next(isTurnUpdate), yield* next(isTurnUpdate)];
+      assert.deepStrictEqual(
+        updates.map((event) =>
+          event.type === "provider_turn.updated" ? event.providerTurn.status : null,
+        ),
+        ["running", "failed"],
       );
-      assert.deepStrictEqual(turnUpdates, ["running", "failed"]);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -317,17 +340,15 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
         ...defaultHandlers,
         "conversation.submit": () => Effect.succeed({ submissionId: 1, status: "placed" }),
       });
-      const { runtime, seen, providerThread } = yield* openRuntime(fake.worker);
+      const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
       // A model or policy change makes the session manager resume the thread again.
       const rebound = yield* runtime.resumeThread({ providerThread });
-      yield* settle;
       assert.strictEqual(fake.subscriberCount(), 1);
       yield* runtime.startTurn(yield* turnInput(rebound));
       yield* fake.push(settled(1));
-      yield* settle;
-      const ended = terminals(seen);
-      assert.lengthOf(ended, 1);
-      assert.isTrue(ended[0]?.type === "turn.terminal" && ended[0].status === "completed");
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+      // A wrongly failed stream would have reported the error before the terminal.
       assert.isFalse(
         seen.some(
           (event) =>

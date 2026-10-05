@@ -27,7 +27,7 @@ import {
 } from "../../orchestration-v2/Adapters/PiDurableAdapterV2.ts";
 import * as ServerConfig from "../../config.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { EMPTY_PI_MODEL_CAPABILITIES } from "../Layers/piThinkingCapabilities.ts";
+import { thinkingCapabilitiesForPiModel } from "../Layers/piThinkingCapabilities.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -70,14 +70,21 @@ export function durableProviderProbe(input: {
   readonly defaultModel: { readonly provider: string; readonly modelId: string } | null;
 }): { readonly probe: ProviderProbe; readonly models: ServerProvider["models"] } {
   const enabled = input.status.scheduling === "enabled";
-  const defaultName =
+  const defaultModel =
     input.defaultModel === null
-      ? null
-      : (input.models.find(
+      ? undefined
+      : input.models.find(
           (model) =>
             model.provider === input.defaultModel?.provider &&
             model.modelId === input.defaultModel.modelId,
-        )?.name ?? `${input.defaultModel.provider}/${input.defaultModel.modelId}`);
+        );
+  const defaultName =
+    input.defaultModel === null
+      ? null
+      : (defaultModel?.name ?? `${input.defaultModel.provider}/${input.defaultModel.modelId}`);
+  // Pi's own derivation: reasoning models offer the thinking levels pi-ai supports.
+  const capabilities = (model: DurableWorkerModel | undefined) =>
+    thinkingCapabilitiesForPiModel(model, undefined);
   return {
     probe: {
       installed: true,
@@ -98,14 +105,14 @@ export function durableProviderProbe(input: {
               slug: PI_INHERIT_MODEL_SLUG,
               name: `Pi default (${defaultName})`,
               isCustom: false,
-              capabilities: EMPTY_PI_MODEL_CAPABILITIES,
+              capabilities: capabilities(defaultModel),
             },
           ]),
       ...input.models.map((model) => ({
         slug: `${model.provider}/${model.modelId}`,
         name: model.name,
         isCustom: false,
-        capabilities: EMPTY_PI_MODEL_CAPABILITIES,
+        capabilities: capabilities(model),
       })),
     ],
   };

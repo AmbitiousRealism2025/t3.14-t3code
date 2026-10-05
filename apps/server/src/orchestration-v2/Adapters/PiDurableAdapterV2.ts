@@ -204,6 +204,8 @@ export interface DurableWorkerModel {
   readonly name: string;
   readonly contextWindow: number;
   readonly reasoning: boolean;
+  /** pi-ai's per-level overrides; with `reasoning` it decides which thinking levels exist. */
+  readonly thinkingLevelMap?: Readonly<Record<string, string | null>>;
 }
 
 export interface DurableWorkerStatus {
