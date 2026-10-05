@@ -876,4 +876,55 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a reattach adopts coding work whatever runtime mode the thread has now", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [5] } } }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 5, status: "placed" }),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 5, status: "placed", entry: 10 } }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime({
+        ...fake.worker,
+        tools: "coding",
+      });
+      // The run started in Full access; the thread was switched afterwards.
+      yield* runtime.startTurn({
+        ...(yield* turnInput(providerThread)),
+        runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: "/tmp",
+        }),
+        reattach: true,
+      });
+      yield* fake.push(settled(5));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a reattach that cannot adopt the kept work stops it", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [5] } } }),
+        "conversation.submit": () =>
+          Effect.fail(new PiDurableWorkerError({ detail: "refused", errorName: "Refused" })),
+      });
+      const { runtime, providerThread } = yield* openRuntime(fake.worker);
+      const error = yield* runtime
+        .startTurn({ ...(yield* turnInput(providerThread)), reattach: true })
+        .pipe(Effect.flip);
+      assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
+      assert.deepStrictEqual(
+        fake.requests.flatMap((request) =>
+          request.method === "conversation.abort" ? [request.params["conversationId"]] : [],
+        ),
+        [CONVERSATION_ID],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });

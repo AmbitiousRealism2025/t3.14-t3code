@@ -31,7 +31,17 @@ export interface DurableBoundRun {
 }
 
 /**
- * Runs the durable worker can still be running: `running`, with a running
+ * A provider turn whose submission was admitted. A turn that settled just
+ * before a crash leaves its run `running` until the run is finalized; the
+ * reattach adopts the settled submission and finishes it. `failed` is left
+ * out: the submission may never have been admitted, and resubmitting it would
+ * start new work.
+ */
+export const isAdoptableProviderTurnStatus = (status: string) =>
+  status === "running" || status === "completed" || status === "interrupted";
+
+/**
+ * Runs the durable worker may still own: `running`, with an adoptable
  * provider turn on the active attempt, on a provider thread bound to a
  * durable conversation.
  */
@@ -50,10 +60,10 @@ export function durableBoundRuns(
         : undefined;
     if (conversation === undefined) return [];
     const attemptId = run.activeAttemptId;
-    const turnRunning = projection.providerTurns.some(
-      (turn) => turn.runAttemptId === attemptId && turn.status === "running",
+    const adoptable = projection.providerTurns.some(
+      (turn) => turn.runAttemptId === attemptId && isAdoptableProviderTurnStatus(turn.status),
     );
-    return turnRunning ? [{ run, attemptId, conversation }] : [];
+    return adoptable ? [{ run, attemptId, conversation }] : [];
   });
 }
 

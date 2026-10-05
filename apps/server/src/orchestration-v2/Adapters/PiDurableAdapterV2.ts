@@ -1719,9 +1719,12 @@ export function makePiDurableAdapterV2(
             ) {
               return yield* protocolError("durable turn requested for a different conversation");
             }
+            const adopt = turnInput.reattach === true;
             // Nothing enforces approvals in the durable runtime yet, so a
-            // workspace-mutating tool profile runs only in Full access.
+            // workspace-mutating tool profile runs only in Full access. Work
+            // being adopted already runs under the mode it started in.
             if (
+              !adopt &&
               worker.tools === "coding" &&
               turnInput.runtimePolicy.runtimeMode !== "full-access"
             ) {
@@ -1735,7 +1738,6 @@ export function makePiDurableAdapterV2(
               );
             }
             providerThread = turnInput.providerThread;
-            const adopt = turnInput.reattach === true;
             if (adopt) {
               // The run already executes with the selection it started with.
               appliedModel = resolveSlug(turnInput.modelSelection.model);
@@ -1820,6 +1822,14 @@ export function makePiDurableAdapterV2(
               ),
             );
           }).pipe(
+            // The worker kept this conversation's work for the reattach. When
+            // the turn cannot adopt it, T3 fails the run, so stop the work
+            // instead of leaving it running with nothing tracking it.
+            Effect.tapError(() =>
+              turnInput.reattach === true && activeTurn === null && conversationId !== null
+                ? call("conversation.abort", { conversationId }).pipe(Effect.ignore)
+                : Effect.void,
+            ),
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterTurnStartError({

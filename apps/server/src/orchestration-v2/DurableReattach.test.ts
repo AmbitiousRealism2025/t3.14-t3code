@@ -305,20 +305,21 @@ it.effect("without a reattach plan a durable run is cancelled as stock T3 does",
   }),
 );
 
-it.effect("a run counts as durable-bound only with a running provider turn on its attempt", () =>
+it.effect("a running run is durable-bound while its provider turn's submission was admitted", () =>
   Effect.sync(() => {
     const projection = recoveryProjection({ withCodexRun: true });
-    assert.deepEqual(
-      DurableReattach.durableBoundRuns(projection).map(({ run }) => run.id),
-      [durableRun],
-    );
-    const settledTurn = {
-      ...projection,
-      providerTurns: projection.providerTurns.map((turn) => ({
-        ...turn,
-        status: "completed" as const,
-      })),
-    };
-    assert.lengthOf(DurableReattach.durableBoundRuns(settledTurn), 0);
+    const withTurnStatus = (
+      status: OrchestrationV2ThreadProjection["providerTurns"][number]["status"],
+    ) =>
+      DurableReattach.durableBoundRuns({
+        ...projection,
+        providerTurns: projection.providerTurns.map((turn) => ({ ...turn, status })),
+      }).map(({ run }) => run.id);
+    assert.deepEqual(withTurnStatus("running"), [durableRun]);
+    // Settled just before the crash, with the run not yet finalized.
+    assert.deepEqual(withTurnStatus("completed"), [durableRun]);
+    assert.deepEqual(withTurnStatus("interrupted"), [durableRun]);
+    // A failed turn may never have admitted its input.
+    assert.deepEqual(withTurnStatus("failed"), []);
   }),
 );

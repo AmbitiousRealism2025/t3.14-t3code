@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/Services/ProviderAuthService.ts";
+import * as DurableReattach from "./DurableReattach.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
@@ -1307,7 +1308,7 @@ export const layer: Layer.Layer<
           cause: `Run ${runId} is missing the execution state needed to reattach it.`,
         });
       }
-      if (providerTurn.status !== "running") return;
+      if (!DurableReattach.isAdoptableProviderTurnStatus(providerTurn.status)) return;
       const providerSessionId = providerThread.providerSessionId;
       // Fails the run and its provider turn while the run is still this running attempt.
       const failRun = (error: Error) =>
