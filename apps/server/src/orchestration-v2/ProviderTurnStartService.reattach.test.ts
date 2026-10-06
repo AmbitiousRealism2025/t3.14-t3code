@@ -20,6 +20,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -52,6 +53,8 @@ const instanceId = ProviderInstanceId.make("pi-durable");
 const pi = ProviderDriverKind.make("pi");
 
 const otherProviderThreadId = ProviderThreadId.make("provider_thread_other");
+
+const turnStartedAt = DateTime.makeUnsafe("2026-10-05T12:00:00.000Z");
 
 const projectionWith = (input: {
   readonly runStatus: string;
@@ -117,6 +120,7 @@ const projectionWith = (input: {
         runAttemptId: attemptId,
         status: "running",
         ordinal: 1,
+        startedAt: turnStartedAt,
       },
     ],
     providerSessions: [],
@@ -160,6 +164,7 @@ const harness = (input: {
   const abandoned: Array<DurableReattach.DurableConversationRef> = [];
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
   let started = 0;
+  let reattachedFrom: unknown = undefined;
   const providerThread = input.projection.providerThreads[0]!;
   const session = {
     driver: pi,
@@ -219,23 +224,29 @@ const harness = (input: {
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({
           // Like the real service: no provider turn unless the run is still current.
           startRootRun: (run) =>
-            input.preparationFails === true
-              ? Effect.void
-              : (run.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
-                  Effect.orDie,
-                  Effect.flatMap((start) =>
-                    start
-                      ? run.session.startTurn({} as never).pipe(
-                          Effect.orDie,
-                          Effect.tap(() =>
-                            Effect.sync(() => {
-                              started += 1;
-                            }),
-                          ),
-                        )
-                      : Effect.void,
-                  ),
-                ),
+            Effect.sync(() => {
+              reattachedFrom = run.reattach;
+            }).pipe(
+              Effect.andThen(
+                input.preparationFails === true
+                  ? Effect.void
+                  : (run.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
+                      Effect.orDie,
+                      Effect.flatMap((start) =>
+                        start
+                          ? run.session.startTurn({} as never).pipe(
+                              Effect.orDie,
+                              Effect.tap(() =>
+                                Effect.sync(() => {
+                                  started += 1;
+                                }),
+                              ),
+                            )
+                          : Effect.void,
+                      ),
+                    ),
+              ),
+            ),
         }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: () =>
@@ -268,7 +279,13 @@ const harness = (input: {
     ),
     Effect.provide(layer),
   );
-  return { reattach, abandoned, writes, started: () => started };
+  return {
+    reattach,
+    abandoned,
+    writes,
+    started: () => started,
+    reattachedFrom: () => reattachedFrom,
+  };
 };
 
 it.effect("a run that ended before its reattach stops the work kept for it", () =>
@@ -376,6 +393,8 @@ it.effect("an adopted run keeps its work", () =>
     yield* test.reattach;
     assert.strictEqual(test.started(), 1);
     assert.deepEqual(test.abandoned, []);
+    // The adopted turn keeps the start it had before the restart.
+    assert.deepEqual(test.reattachedFrom(), { startedAt: turnStartedAt });
   }),
 );
 
