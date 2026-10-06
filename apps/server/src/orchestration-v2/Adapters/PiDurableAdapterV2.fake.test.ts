@@ -1084,4 +1084,76 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a reattached turn resubmits the steers T3 accepted and waits for them", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [5] } } }),
+        // The input is held; steer 2 was answered before the restart; steer 3
+        // never reached the worker.
+        "conversation.submit": (params) =>
+          Effect.succeed(
+            String(params["requestId"]).endsWith(":1")
+              ? { submissionId: 5, status: "placed" }
+              : String(params["requestId"]).endsWith(":2")
+                ? { submissionId: 6, status: "done" }
+                : { submissionId: 7, status: "queued" },
+          ),
+        "submission.status": (params) =>
+          Effect.succeed({
+            record:
+              params["submissionId"] === 6
+                ? { id: 6, status: "done", entry: 12, answer: 13 }
+                : { id: 5, status: "placed", entry: 10 },
+          }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      const steer = (ordinal: number) => ({
+        ...input.message,
+        messageId: `message:${THREAD_ID}:${ordinal}` as never,
+        text: `steer ${ordinal}`,
+      });
+      yield* runtime.startTurn({
+        ...input,
+        reattach: { startedAt: null, steers: [steer(2), steer(3)] },
+      });
+      yield* fake.push(settled(5), marker("still the turn's"));
+      const first = yield* next(
+        (event) => isTerminal(event) || isMarker("still the turn's")(event),
+      );
+      assert.isFalse(isTerminal(first), "the turn waits for the steer the restart cut off");
+      yield* fake.push(settled(7));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+      assert.deepStrictEqual(
+        fake.requests.flatMap((request) =>
+          request.method === "conversation.submit"
+            ? [[request.params["requestId"], request.params["whenBusy"]]]
+            : [],
+        ),
+        [
+          [`t3:${THREAD_ID}:message:${THREAD_ID}:1`, "followUp"],
+          [`t3:${THREAD_ID}:message:${THREAD_ID}:2`, "steer"],
+          [`t3:${THREAD_ID}:message:${THREAD_ID}:3`, "steer"],
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a submit that returns an already settled submission ends the turn", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.submit": () => Effect.succeed({ submissionId: 4, status: "done" }),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 4, status: "done", entry: 8, answer: 9 } }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn(yield* turnInput(providerThread));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });
