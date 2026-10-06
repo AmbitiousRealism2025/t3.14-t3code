@@ -405,9 +405,10 @@ export interface ProviderAdapterV2TurnInput {
   /**
    * T3.14: the provider accepted this turn before a server restart and kept
    * running it. Adopt the running work under this attempt instead of
-   * submitting the message as new input.
+   * submitting the message as new input. `startedAt` is the provider turn's
+   * original start, so its duration includes the time before the restart.
    */
-  readonly reattach?: boolean;
+  readonly reattach?: { readonly startedAt: OrchestrationV2ProviderTurn["startedAt"] };
   readonly attemptId: RunAttemptId;
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;

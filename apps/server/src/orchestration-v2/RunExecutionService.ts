@@ -44,6 +44,7 @@ import type {
   ProviderAdapterV2Event,
   ProviderAdapterV2RuntimePolicy,
   ProviderAdapterV2SessionRuntime,
+  ProviderAdapterV2TurnInput,
   ProviderAdapterV2TurnMessage,
 } from "./ProviderAdapter.ts";
 import { ProviderAdapterTurnStartError } from "./ProviderAdapter.ts";
@@ -513,7 +514,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
    * baseline was captured before the restart; capturing again would fold the
    * turn's own changes into it.
    */
-  readonly reattach?: boolean;
+  readonly reattach?: ProviderAdapterV2TurnInput["reattach"];
   readonly loadInheritedBackgroundTurnItems?: () => Effect.Effect<
     ReadonlyArray<InheritedBackgroundTurnItemRoute>,
     unknown
@@ -842,7 +843,7 @@ export const layer: Layer.Layer<
               ),
             );
             yield* (
-              input.reattach === true
+              input.reattach !== undefined
                 ? Effect.void
                 : checkpointService.captureBaseline({
                     scope: input.checkpointScope,
@@ -1365,7 +1366,7 @@ export const layer: Layer.Layer<
               : {
                   restartContinuationOfRunId: input.run.restartContinuationOfRunId,
                 }),
-            ...(input.reattach === true ? { reattach: true } : {}),
+            ...(input.reattach === undefined ? {} : { reattach: input.reattach }),
             attemptId: input.attemptId,
             rootNodeId: input.rootNode.id,
             providerThread: input.providerThread,

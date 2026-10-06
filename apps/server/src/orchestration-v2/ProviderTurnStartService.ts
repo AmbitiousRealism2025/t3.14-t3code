@@ -1600,7 +1600,7 @@ export const layer: Layer.Layer<
         providerThread: runningProviderThread,
         attempt,
         attemptId: attempt.id,
-        reattach: true,
+        reattach: { startedAt: providerTurn.startedAt },
         providerTurnOrdinal: providerTurn.ordinal,
         nativeThreadHasTurns: true,
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,

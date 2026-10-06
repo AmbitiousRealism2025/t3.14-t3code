@@ -770,7 +770,7 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
       const input = yield* turnInput(providerThread);
       const starting = yield* runtime
-        .startTurn({ ...input, reattach: true })
+        .startTurn({ ...input, reattach: { startedAt: null } })
         .pipe(Effect.forkScoped);
       // The run streams more before the turn has adopted it.
       yield* Deferred.await(statusAsked);
@@ -866,7 +866,10 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
           Effect.succeed({ record: { id: 5, status: "done", entry: 10, answer: 11 } }),
       });
       const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
-      yield* runtime.startTurn({ ...(yield* turnInput(providerThread)), reattach: true });
+      yield* runtime.startTurn({
+        ...(yield* turnInput(providerThread)),
+        reattach: { startedAt: null },
+      });
       const ended = yield* next(isTerminal);
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
       assert.deepStrictEqual(
@@ -899,7 +902,7 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
           interactionMode: "default",
           cwd: "/tmp",
         }),
-        reattach: true,
+        reattach: { startedAt: null },
       });
       yield* fake.push(settled(5));
       const ended = yield* next(isTerminal);
@@ -917,7 +920,7 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       });
       const { runtime, providerThread } = yield* openRuntime(fake.worker);
       const error = yield* runtime
-        .startTurn({ ...(yield* turnInput(providerThread)), reattach: true })
+        .startTurn({ ...(yield* turnInput(providerThread)), reattach: { startedAt: null } })
         .pipe(Effect.flip);
       assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
       assert.deepStrictEqual(
@@ -987,7 +990,10 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
           Effect.succeed({ record: { id: 5, status: "placed", entry: 10 } }),
       });
       const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
-      yield* runtime.startTurn({ ...(yield* turnInput(providerThread)), reattach: true });
+      yield* runtime.startTurn({
+        ...(yield* turnInput(providerThread)),
+        reattach: { startedAt: null },
+      });
       yield* fake.push(
         settled(5),
         settled(6),
@@ -1024,7 +1030,7 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       });
       const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
       const starting = yield* runtime
-        .startTurn({ ...(yield* turnInput(providerThread)), reattach: true })
+        .startTurn({ ...(yield* turnInput(providerThread)), reattach: { startedAt: null } })
         .pipe(Effect.forkScoped);
       yield* Deferred.await(statusAsked);
       // Both runs finish before the turn has adopted them.
@@ -1042,6 +1048,40 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       const ended = yield* next(isTerminal);
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
       assert.isTrue(seen.some(isMarker("the steer's answer")), "the steer's output is kept");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a reattached turn keeps its original start and retries an unanswered status read", () =>
+    Effect.gen(function* () {
+      const startedAt = DateTime.makeUnsafe("2026-10-05T12:00:00.000Z");
+      let statusReads = 0;
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [5] } } }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 5, status: "placed" }),
+        // The first read gets no answer; the same read is asked again.
+        "submission.status": () => {
+          statusReads += 1;
+          return statusReads === 1
+            ? Effect.fail(
+                new PiDurableWorkerError({ detail: "Pi RPC submission.status timed out" }),
+              )
+            : Effect.succeed({ record: { id: 5, status: "placed", entry: 10 } });
+        },
+      });
+      const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn({ ...(yield* turnInput(providerThread)), reattach: { startedAt } });
+      yield* fake.push(settled(5));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+      assert.strictEqual(statusReads, 2);
+      const turnStarts = seen.flatMap((event) =>
+        event.type === "provider_turn.updated" ? [event.providerTurn.startedAt] : [],
+      );
+      assert.isAbove(turnStarts.length, 1);
+      assert.isTrue(
+        turnStarts.every((value) => value !== null && DateTime.Equivalence(value, startedAt)),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

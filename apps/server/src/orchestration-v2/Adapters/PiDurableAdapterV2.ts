@@ -1653,7 +1653,7 @@ export function makePiDurableAdapterV2(
           // An adopted submission may have settled before this session
           // watched; its record also names the input's transcript entry.
           const record = adopt
-            ? recordField(yield* call("submission.status", { submissionId }), "record")
+            ? recordField(yield* call("submission.status", { submissionId }, true), "record")
             : undefined;
           return { submissionId, record };
         }).pipe(Effect.exit);
@@ -1768,7 +1768,7 @@ export function makePiDurableAdapterV2(
             ) {
               return yield* protocolError("durable turn requested for a different conversation");
             }
-            const adopt = turnInput.reattach === true;
+            const adopt = turnInput.reattach !== undefined;
             // Nothing enforces approvals in the durable runtime yet, so a
             // workspace-mutating tool profile runs only in Full access. Work
             // being adopted already runs under the mode it started in.
@@ -1795,7 +1795,8 @@ export function makePiDurableAdapterV2(
             } else {
               yield* applySelection(turnInput.modelSelection);
             }
-            const startedAt = yield* DateTime.now;
+            // An adopted turn keeps the start it had before the restart.
+            const startedAt = turnInput.reattach?.startedAt ?? (yield* DateTime.now);
             const syntheticNativeTurnId = `${providerThread.id}:attempt:${turnInput.attemptId}`;
             const turn: ActiveDurableTurn = {
               turnInput,
@@ -1875,7 +1876,7 @@ export function makePiDurableAdapterV2(
             // the turn cannot adopt it, T3 fails the run, so stop the work
             // instead of leaving it running with nothing tracking it.
             Effect.tapError(() =>
-              turnInput.reattach === true && activeTurn === null && conversationId !== null
+              turnInput.reattach !== undefined && activeTurn === null && conversationId !== null
                 ? call("conversation.abort", { conversationId }).pipe(Effect.ignore)
                 : Effect.void,
             ),
