@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -1581,7 +1582,16 @@ export const layer: Layer.Layer<
         providerTurnOrdinal: providerTurn.ordinal,
         nativeThreadHasTurns: true,
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,
-        shouldStartProviderTurn: runControls.shouldStartProviderTurn,
+        // Stop or deletion can still take the run before the turn adopts the
+        // work; then nothing will, so the kept work is stopped.
+        shouldStartProviderTurn: () =>
+          runControls
+            .shouldStartProviderTurn()
+            .pipe(
+              Effect.onExit((exit) =>
+                Exit.isSuccess(exit) && exit.value ? Effect.void : abandonKeptWork,
+              ),
+            ),
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {

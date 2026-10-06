@@ -147,7 +147,8 @@ export class DurableReattachPlan extends Context.Service<
     ) => Effect.Effect<void, never, Scope.Scope>;
     /**
      * Stops kept work no reattach will adopt, such as the work of a run that
-     * ended before its reattach ran. Does nothing for an unknown instance.
+     * ended before its reattach ran. The conversation also leaves the plan,
+     * so a worker the instance starts later does not keep it.
      */
     readonly abandon: (
       instanceId: ProviderInstanceId,
@@ -158,6 +159,9 @@ export class DurableReattachPlan extends Context.Service<
 
 export const make = Effect.gen(function* () {
   const recorded = yield* Deferred.make<ReadonlyArray<DurableReattachPlanEntry>>();
+  const abandoned = new Set<string>();
+  const key = (instanceId: ProviderInstanceId, conversation: DurableConversationRef) =>
+    `${instanceId}\u0000${conversation.storeId}\u0000${conversation.conversationId}`;
   const abandoners = new Map<
     ProviderInstanceId,
     (conversation: DurableConversationRef) => Effect.Effect<void>
@@ -172,12 +176,19 @@ export const make = Effect.gen(function* () {
           }),
       ).pipe(Effect.asVoid),
     abandon: (instanceId, conversation) =>
-      Effect.suspend(() => abandoners.get(instanceId)?.(conversation) ?? Effect.void),
+      Effect.suspend(() => {
+        abandoned.add(key(instanceId, conversation));
+        return abandoners.get(instanceId)?.(conversation) ?? Effect.void;
+      }),
     complete: (entries) => Deferred.succeed(recorded, entries).pipe(Effect.asVoid),
     conversationsFor: (instanceId) =>
       Deferred.await(recorded).pipe(
         Effect.map((entries) =>
-          entries.flatMap((entry) => (entry.instanceId === instanceId ? [entry.conversation] : [])),
+          entries.flatMap((entry) =>
+            entry.instanceId === instanceId && !abandoned.has(key(instanceId, entry.conversation))
+              ? [entry.conversation]
+              : [],
+          ),
         ),
       ),
   });

@@ -422,3 +422,18 @@ it.effect("the plan stops kept work through the instance that registered", () =>
     assert.deepEqual(stopped, [7]);
   }),
 );
+
+it.effect("work abandoned before its instance registered is not kept by a later worker", () =>
+  Effect.gen(function* () {
+    const plan = yield* DurableReattach.make;
+    yield* plan.complete([
+      { instanceId: durableInstance, conversation: { storeId: STORE_ID, conversationId: 7 } },
+      { instanceId: durableInstance, conversation: { storeId: STORE_ID, conversationId: 8 } },
+    ]);
+    // The instance could not be built at startup; its run failed.
+    yield* plan.abandon(durableInstance, { storeId: STORE_ID, conversationId: 7 });
+    assert.deepEqual(yield* plan.conversationsFor(durableInstance), [
+      { storeId: STORE_ID, conversationId: 8 },
+    ]);
+  }),
+);

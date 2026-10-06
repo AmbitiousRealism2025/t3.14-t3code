@@ -150,6 +150,8 @@ const harness = (input: {
   readonly attachCommits?: boolean;
   readonly resumeFails?: boolean;
   readonly openFails?: boolean;
+  /** The run as committed now, when Stop or deletion lands after the attach. */
+  readonly current?: OrchestrationV2ThreadProjection;
 }) => {
   const abandoned: Array<DurableReattach.DurableConversationRef> = [];
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
@@ -190,7 +192,7 @@ const harness = (input: {
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getTurnStartContext: () =>
             Effect.succeed({ ...input.projection, hasConversation: true } as never),
-          getRuntimeRecoveryProjection: () => Effect.succeed(input.projection),
+          getRuntimeRecoveryProjection: () => Effect.succeed(input.current ?? input.projection),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           open: () =>
@@ -200,10 +202,14 @@ const harness = (input: {
         }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({}),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({
-          startRootRun: () =>
-            Effect.sync(() => {
-              started += 1;
-            }),
+          // Like the real service: no provider turn unless the run is still current.
+          startRootRun: (run) =>
+            (run.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
+              Effect.orDie,
+              Effect.map((start) => {
+                if (start) started += 1;
+              }),
+            ),
         }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: () =>
@@ -277,6 +283,18 @@ it.effect("a final failed session open fails the run and stops the kept work", (
         .flat()
         .some((event) => event.type === "run.updated" && event.payload.status === "failed"),
     );
+    assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
+  }),
+);
+
+it.effect("a run stopped after the attach but before adoption stops the kept work", () =>
+  Effect.gen(function* () {
+    const test = harness({
+      projection: projectionWith({ runStatus: "running" }),
+      current: projectionWith({ runStatus: "interrupted" }),
+    });
+    yield* test.reattach;
+    assert.strictEqual(test.started(), 0);
     assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
   }),
 );
