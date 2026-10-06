@@ -153,6 +153,19 @@ export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
       ? { keepConversations: reattachPlan.value.conversationsFor(instanceId) }
       : {}),
   });
+  if (Option.isSome(reattachPlan)) {
+    // Stops kept work whose run ended before its reattach adopted it.
+    yield* reattachPlan.value.registerAbandon(instanceId, (conversation) =>
+      workers.get.pipe(
+        Effect.flatMap((worker) =>
+          worker.status.storeId === conversation.storeId
+            ? worker.request("conversation.abort", { conversationId: conversation.conversationId })
+            : Effect.void,
+        ),
+        Effect.ignore,
+      ),
+    );
+  }
   const stamp = (snapshot: Omit<ServerProvider, "instanceId" | "driver">): ServerProvider => ({
     ...snapshot,
     instanceId,

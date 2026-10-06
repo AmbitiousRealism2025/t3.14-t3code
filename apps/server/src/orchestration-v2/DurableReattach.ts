@@ -15,6 +15,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import type * as Scope from "effect/Scope";
 
 import { parseDurableThreadRef } from "./Adapters/PiDurableAdapterV2.ts";
 
@@ -35,12 +36,20 @@ export interface DurableBoundRun {
 /**
  * A provider turn whose submission was admitted. A turn that settled just
  * before a crash leaves its run `running` until the run is finalized; the
- * reattach adopts the settled submission and finishes it. `failed` is left
- * out: the submission may never have been admitted, and resubmitting it would
- * start new work.
+ * reattach adopts the settled submission and finishes it. A `failed` turn
+ * counts only with the strong submission ref the adapter sets once its input
+ * was admitted: a failure before admission has none, and resubmitting it
+ * would start new work.
  */
-export const isAdoptableProviderTurnStatus = (status: string) =>
-  status === "running" || status === "completed" || status === "interrupted";
+export const isAdoptableProviderTurn = (
+  turn: Pick<ProjectionRuntimeRecoveryState["providerTurns"][number], "status" | "nativeTurnRef">,
+) =>
+  turn.status === "running" ||
+  turn.status === "completed" ||
+  turn.status === "interrupted" ||
+  (turn.status === "failed" &&
+    turn.nativeTurnRef?.strength === "strong" &&
+    turn.nativeTurnRef.nativeId?.startsWith("pi-durable-submission:") === true);
 
 /**
  * Runs the durable worker may still own: `running`, with an adoptable
@@ -63,7 +72,7 @@ export function durableBoundRuns(
     if (conversation === undefined) return [];
     const attemptId = run.activeAttemptId;
     const adoptable = projection.providerTurns.some(
-      (turn) => turn.runAttemptId === attemptId && isAdoptableProviderTurnStatus(turn.status),
+      (turn) => turn.runAttemptId === attemptId && isAdoptableProviderTurn(turn),
     );
     return adoptable ? [{ run, attemptId, conversation }] : [];
   });
@@ -131,12 +140,39 @@ export class DurableReattachPlan extends Context.Service<
     readonly conversationsFor: (
       instanceId: ProviderInstanceId,
     ) => Effect.Effect<ReadonlyArray<DurableConversationRef>>;
+    /** How an instance stops work its worker kept, for as long as the scope lives. */
+    readonly registerAbandon: (
+      instanceId: ProviderInstanceId,
+      abandon: (conversation: DurableConversationRef) => Effect.Effect<void>,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    /**
+     * Stops kept work no reattach will adopt, such as the work of a run that
+     * ended before its reattach ran. Does nothing for an unknown instance.
+     */
+    readonly abandon: (
+      instanceId: ProviderInstanceId,
+      conversation: DurableConversationRef,
+    ) => Effect.Effect<void>;
   }
 >()("t3/orchestration-v2/DurableReattach/DurableReattachPlan") {}
 
 export const make = Effect.gen(function* () {
   const recorded = yield* Deferred.make<ReadonlyArray<DurableReattachPlanEntry>>();
+  const abandoners = new Map<
+    ProviderInstanceId,
+    (conversation: DurableConversationRef) => Effect.Effect<void>
+  >();
   return DurableReattachPlan.of({
+    registerAbandon: (instanceId, abandon) =>
+      Effect.acquireRelease(
+        Effect.sync(() => abandoners.set(instanceId, abandon)),
+        () =>
+          Effect.sync(() => {
+            if (abandoners.get(instanceId) === abandon) abandoners.delete(instanceId);
+          }),
+      ).pipe(Effect.asVoid),
+    abandon: (instanceId, conversation) =>
+      Effect.suspend(() => abandoners.get(instanceId)?.(conversation) ?? Effect.void),
     complete: (entries) => Deferred.succeed(recorded, entries).pipe(Effect.asVoid),
     conversationsFor: (instanceId) =>
       Deferred.await(recorded).pipe(

@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/Services/ProviderAuthService.ts";
+import { parseDurableThreadRef } from "./Adapters/PiDurableAdapterV2.ts";
 import * as DurableReattach from "./DurableReattach.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -119,6 +120,8 @@ export const layer: Layer.Layer<
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    // T3.14: stops durable work a reattach found nothing to adopt for (W02).
+    const reattachPlan = yield* Effect.serviceOption(DurableReattach.DurableReattachPlan);
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
 
     // These callbacks outlive startup while a run drains background work. Build
@@ -1278,8 +1281,38 @@ export const layer: Layer.Layer<
       const { runId } = input;
       const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
       const run = projection.runs.find((candidate) => candidate.id === runId);
-      // Nothing to adopt once the run has settled or moved to another attempt.
-      if (run === undefined || run.status !== "running") return;
+      if (run === undefined) return;
+      // The worker kept this run's conversation running for the reattach.
+      // When the run ended first (Stop, thread deletion) or loses ownership
+      // during it, nothing will adopt that work, so it is stopped. A newer
+      // run on the thread may be using the conversation; then it is left.
+      const abandonKeptWork = Effect.gen(function* () {
+        if (Option.isNone(reattachPlan)) return;
+        const nativeId = projection.providerThreads.find(
+          (candidate) => candidate.id === run.providerThreadId,
+        )?.nativeThreadRef?.nativeId;
+        const conversation = nativeId == null ? undefined : parseDurableThreadRef(nativeId);
+        if (conversation === undefined) return;
+        const current = yield* projectionStore.getRuntimeRecoveryProjection(input.threadId);
+        const superseded = current.runs.some(
+          (candidate) =>
+            candidate.id !== runId &&
+            (candidate.status === "starting" || candidate.status === "running"),
+        );
+        if (superseded) return;
+        yield* Effect.logWarning("Stopping durable work whose run ended before its reattach", {
+          runId,
+        });
+        yield* reattachPlan.value.abandon(run.providerInstanceId, conversation);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to stop durable work kept for a reattach", { runId, cause }),
+        ),
+      );
+      if (run.status !== "running") {
+        yield* abandonKeptWork;
+        return;
+      }
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
       const providerThread = projection.providerThreads.find(
@@ -1308,7 +1341,7 @@ export const layer: Layer.Layer<
           cause: `Run ${runId} is missing the execution state needed to reattach it.`,
         });
       }
-      if (!DurableReattach.isAdoptableProviderTurnStatus(providerTurn.status)) return;
+      if (!DurableReattach.isAdoptableProviderTurn(providerTurn)) return;
       const providerSessionId = providerThread.providerSessionId;
       // Fails the run and its provider turn while the run is still this running attempt.
       const failRun = (error: Error) =>
@@ -1521,7 +1554,10 @@ export const layer: Layer.Layer<
           },
         ],
       });
-      if (!attached.committed) return;
+      if (!attached.committed) {
+        yield* abandonKeptWork;
+        return;
+      }
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:durable-run.reattach:${run.id}`),
         appThread: projection.thread,

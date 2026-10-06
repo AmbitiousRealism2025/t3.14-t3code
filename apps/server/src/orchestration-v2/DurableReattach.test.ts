@@ -374,3 +374,51 @@ it.effect("a failed reattach settles the run's open output and leaves the rest",
     );
   }),
 );
+
+it.effect("a failed provider turn is adoptable only once its input was admitted", () =>
+  Effect.sync(() => {
+    const projection = recoveryProjection({ withCodexRun: false });
+    const withFailedTurn = (nativeTurnRef: unknown) =>
+      DurableReattach.durableBoundRuns({
+        ...projection,
+        providerTurns: projection.providerTurns.map((turn) => ({
+          ...turn,
+          status: "failed" as const,
+          nativeTurnRef: nativeTurnRef as never,
+        })),
+      }).map(({ run }) => run.id);
+    // The adapter sets the submission ref when the turn's input settles.
+    assert.deepEqual(
+      withFailedTurn({
+        driver: "pi",
+        nativeId: `pi-durable-submission:${STORE_ID}:5`,
+        strength: "strong",
+      }),
+      [durableRun],
+    );
+    // A turn refused before admission keeps its weak synthetic ref.
+    assert.deepEqual(
+      withFailedTurn({ driver: "pi", nativeId: "thread:attempt:1", strength: "weak" }),
+      [],
+    );
+  }),
+);
+
+it.effect("the plan stops kept work through the instance that registered", () =>
+  Effect.gen(function* () {
+    const plan = yield* DurableReattach.make;
+    const stopped: Array<number> = [];
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* plan.registerAbandon(durableInstance, (conversation) =>
+          Effect.sync(() => stopped.push(conversation.conversationId)),
+        );
+        yield* plan.abandon(durableInstance, { storeId: STORE_ID, conversationId: 7 });
+        yield* plan.abandon(codexInstance, { storeId: STORE_ID, conversationId: 8 });
+      }),
+    );
+    // The registration ends with the instance.
+    yield* plan.abandon(durableInstance, { storeId: STORE_ID, conversationId: 9 });
+    assert.deepEqual(stopped, [7]);
+  }),
+);
