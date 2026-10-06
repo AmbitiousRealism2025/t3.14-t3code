@@ -152,6 +152,10 @@ const harness = (input: {
   readonly openFails?: boolean;
   /** The run as committed now, when Stop or deletion lands after the attach. */
   readonly current?: OrchestrationV2ThreadProjection;
+  readonly policyFails?: boolean;
+  /** Run execution fails its preparation and settles the run itself. */
+  readonly preparationFails?: boolean;
+  readonly willRetry?: boolean;
 }) => {
   const abandoned: Array<DurableReattach.DurableConversationRef> = [];
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
@@ -171,6 +175,7 @@ const harness = (input: {
             }),
           )
         : Effect.succeed(providerThread),
+    startTurn: () => Effect.void,
   };
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
@@ -204,20 +209,33 @@ const harness = (input: {
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({
           // Like the real service: no provider turn unless the run is still current.
           startRootRun: (run) =>
-            (run.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
-              Effect.orDie,
-              Effect.map((start) => {
-                if (start) started += 1;
-              }),
-            ),
+            input.preparationFails === true
+              ? Effect.void
+              : (run.shouldStartProviderTurn?.() ?? Effect.succeed(true)).pipe(
+                  Effect.orDie,
+                  Effect.flatMap((start) =>
+                    start
+                      ? run.session.startTurn({} as never).pipe(
+                          Effect.orDie,
+                          Effect.tap(() =>
+                            Effect.sync(() => {
+                              started += 1;
+                            }),
+                          ),
+                        )
+                      : Effect.void,
+                  ),
+                ),
         }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: () =>
-            Effect.succeed({
-              runtimeMode: "full-access",
-              interactionMode: "default",
-              cwd: "/tmp",
-            } as never),
+            input.policyFails === true
+              ? Effect.fail(new Error("project record is missing") as never)
+              : Effect.succeed({
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  cwd: "/tmp",
+                } as never),
         }),
         Layer.succeed(
           DurableReattach.DurableReattachPlan,
@@ -235,7 +253,9 @@ const harness = (input: {
     ),
   );
   const reattach = ProviderTurnStart.ProviderTurnStartServiceV2.pipe(
-    Effect.flatMap((service) => service.reattach({ threadId, runId })),
+    Effect.flatMap((service) =>
+      service.reattach({ threadId, runId, ...(input.willRetry ? { willRetry: true } : {}) }),
+    ),
     Effect.provide(layer),
   );
   return { reattach, abandoned, writes, started: () => started };
@@ -337,5 +357,56 @@ it.effect("a failed resume fails the run and settles its open output", () =>
       ),
     );
     assert.strictEqual(test.started(), 0);
+  }),
+);
+
+it.effect("an adopted run keeps its work", () =>
+  Effect.gen(function* () {
+    const test = harness({ projection: projectionWith({ runStatus: "running" }) });
+    yield* test.reattach;
+    assert.strictEqual(test.started(), 1);
+    assert.deepEqual(test.abandoned, []);
+  }),
+);
+
+it.effect("a reattach that fails for good fails the run and stops the kept work", () =>
+  Effect.gen(function* () {
+    const test = harness({
+      projection: projectionWith({ runStatus: "running" }),
+      policyFails: true,
+    });
+    const exit = yield* Effect.exit(test.reattach);
+    assert.isTrue(exit._tag === "Failure");
+    assert.isTrue(
+      test.writes
+        .flat()
+        .some((event) => event.type === "run.updated" && event.payload.status === "failed"),
+    );
+    assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
+  }),
+);
+
+it.effect("a reattach that will be retried leaves the kept work for the retry", () =>
+  Effect.gen(function* () {
+    const test = harness({
+      projection: projectionWith({ runStatus: "running" }),
+      policyFails: true,
+      willRetry: true,
+    });
+    yield* Effect.exit(test.reattach);
+    assert.deepEqual(test.writes, []);
+    assert.deepEqual(test.abandoned, []);
+  }),
+);
+
+it.effect("a run whose preparation fails before adoption stops the kept work", () =>
+  Effect.gen(function* () {
+    const test = harness({
+      projection: projectionWith({ runStatus: "running" }),
+      preparationFails: true,
+    });
+    yield* test.reattach;
+    assert.strictEqual(test.started(), 0);
+    assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
   }),
 );

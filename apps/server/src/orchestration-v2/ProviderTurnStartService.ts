@@ -1274,18 +1274,27 @@ export const layer: Layer.Layer<
       });
     });
 
-    const reattach = Effect.fn("orchestrationV2.providerTurnStart.reattach")(function* (input: {
-      readonly threadId: ThreadId;
-      readonly runId: RunId;
-      readonly willRetry?: boolean;
-    }) {
+    interface ReattachState {
+      /** An adapter turn took the kept work over. */
+      adopted: boolean;
+      /** Stops the kept work, once the run and its conversation are known. */
+      abandon: Effect.Effect<void> | undefined;
+      /** Fails the run while it is still this running attempt. */
+      failRun: ((error: Error) => Effect.Effect<void, unknown>) | undefined;
+    }
+
+    const reattachOnce = Effect.fn("orchestrationV2.providerTurnStart.reattach")(function* (
+      input: {
+        readonly threadId: ThreadId;
+        readonly runId: RunId;
+        readonly willRetry?: boolean;
+      },
+      state: ReattachState,
+    ) {
       const { runId } = input;
       const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
       const run = projection.runs.find((candidate) => candidate.id === runId);
       if (run === undefined) return;
-      // The worker kept this run's conversation running for the reattach.
-      // When the run ended first (Stop, thread deletion), loses ownership
-      // during it, or fails, nothing will adopt that work, so it is stopped.
       // A newer run on the same conversation may be using it; then it is left.
       const abandonKeptWork = Effect.gen(function* () {
         if (Option.isNone(reattachPlan)) return;
@@ -1317,10 +1326,9 @@ export const layer: Layer.Layer<
           Effect.logWarning("Failed to stop durable work kept for a reattach", { runId, cause }),
         ),
       );
-      if (run.status !== "running") {
-        yield* abandonKeptWork;
-        return;
-      }
+      state.abandon = abandonKeptWork;
+      // Ended before its reattach ran (Stop, thread deletion).
+      if (run.status !== "running") return;
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
       const providerThread = projection.providerThreads.find(
@@ -1469,8 +1477,8 @@ export const layer: Layer.Layer<
             expectedStatus: "running",
             events,
           });
-          yield* abandonKeptWork;
         });
+      state.failRun = failRun;
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
         thread: projection.thread,
         modelSelection: run.modelSelection,
@@ -1563,15 +1571,23 @@ export const layer: Layer.Layer<
           },
         ],
       });
-      if (!attached.committed) {
-        yield* abandonKeptWork;
-        return;
-      }
+      if (!attached.committed) return;
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:durable-run.reattach:${run.id}`),
         appThread: projection.thread,
         providerSessionId,
-        session,
+        // The adapter's turn has taken the kept work over once startTurn succeeds.
+        session: {
+          ...session,
+          startTurn: (turnInput) =>
+            session.startTurn(turnInput).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  state.adopted = true;
+                }),
+              ),
+            ),
+        },
         run,
         rootNode,
         checkpointScope,
@@ -1582,16 +1598,7 @@ export const layer: Layer.Layer<
         providerTurnOrdinal: providerTurn.ordinal,
         nativeThreadHasTurns: true,
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,
-        // Stop or deletion can still take the run before the turn adopts the
-        // work; then nothing will, so the kept work is stopped.
-        shouldStartProviderTurn: () =>
-          runControls
-            .shouldStartProviderTurn()
-            .pipe(
-              Effect.onExit((exit) =>
-                Exit.isSuccess(exit) && exit.value ? Effect.void : abandonKeptWork,
-              ),
-            ),
+        shouldStartProviderTurn: runControls.shouldStartProviderTurn,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {
@@ -1608,6 +1615,44 @@ export const layer: Layer.Layer<
         runtimePolicy: resolvedRuntimePolicy,
       });
     });
+
+    /**
+     * The worker keeps a reattached run's conversation running, so a reattach
+     * ends in one of two ways: an adapter turn takes the work over, or the
+     * work is stopped. Every other outcome lands here: the run ended or was
+     * lost before adoption, or the reattach failed for good. A failure the
+     * effect will retry, and an interruption (the server stopping), leave
+     * the work for the next attempt or startup.
+     */
+    const reattach = (input: {
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly willRetry?: boolean;
+    }) =>
+      Effect.gen(function* () {
+        const state: ReattachState = { adopted: false, abandon: undefined, failRun: undefined };
+        const exit = yield* Effect.exit(reattachOnce(input, state));
+        const interrupted = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause);
+        const retrying = Exit.isFailure(exit) && input.willRetry === true;
+        if (!state.adopted && !interrupted && !retrying) {
+          if (Exit.isFailure(exit) && state.failRun !== undefined) {
+            yield* state
+              .failRun(
+                new ProviderTurnStartError({ runId: input.runId, cause: Cause.squash(exit.cause) }),
+              )
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to fail a run whose reattach failed", {
+                    runId: input.runId,
+                    cause,
+                  }),
+                ),
+              );
+          }
+          if (state.abandon !== undefined) yield* state.abandon;
+        }
+        return yield* exit;
+      });
 
     const asTurnStartError =
       (runId: RunId) =>
