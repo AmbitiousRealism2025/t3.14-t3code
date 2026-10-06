@@ -126,6 +126,8 @@ const recoveryLayer = (input: {
   readonly commits: Array<CommitInput>;
   readonly writes: Array<WriteInput>;
   readonly cancelUnsettled?: EffectOutbox.EffectOutboxV2["Service"]["cancelUnsettled"];
+  /** The user pressed Stop and the restart came before its effect ran. */
+  readonly stopRequested?: boolean;
 }) =>
   ProviderRuntimeRecovery.layer.pipe(
     Layer.provide(ServerSettings.layerTest()),
@@ -134,6 +136,7 @@ const recoveryLayer = (input: {
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(input.projection),
+          hasUnpairedRunInterruptRequest: () => Effect.succeed(input.stopRequested === true),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           commitCommand: (commit) => {
@@ -435,5 +438,40 @@ it.effect("work abandoned before its instance registered is not kept by a later 
     assert.deepEqual(yield* plan.conversationsFor(durableInstance), [
       { storeId: STORE_ID, conversationId: 8 },
     ]);
+  }),
+);
+
+it.effect("a run stopped before the restart is cancelled, not reattached", () =>
+  Effect.gen(function* () {
+    const plan = yield* DurableReattach.make;
+    const commits: Array<CommitInput> = [];
+    const writes: Array<WriteInput> = [];
+    yield* Effect.gen(function* () {
+      yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).recover;
+    }).pipe(
+      Effect.provide(
+        recoveryLayer({
+          projection: recoveryProjection({ withCodexRun: false }),
+          plan,
+          commits,
+          writes,
+          stopRequested: true,
+        }),
+      ),
+    );
+    assert.deepEqual(
+      runEvents(commits[0], durableRun).map((event) =>
+        event.type === "run.updated" ? event.payload.status : null,
+      ),
+      ["cancelled"],
+    );
+    assert.deepEqual(
+      [...(commits[0]?.effects ?? []), ...writes.flatMap((write) => write.effects)].filter(
+        (effect) => effect.request.type === "durable-run.reattach",
+      ),
+      [],
+    );
+    // Its worker is not told to keep the work, so it aborts it.
+    assert.deepEqual(yield* plan.conversationsFor(durableInstance), []);
   }),
 );

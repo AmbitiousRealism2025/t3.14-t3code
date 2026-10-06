@@ -180,8 +180,31 @@ export const make = Effect.gen(function* () {
   const outbox = yield* EffectOutbox.EffectOutboxV2;
   // T3.14: present when this server can reattach durable runs (W02).
   const reattachPlan = yield* Effect.serviceOption(DurableReattach.DurableReattachPlan);
+  // A run the user stopped before the restart is not reattached, even when
+  // the Stop's effect never ran: it is cancelled as stock, and its worker
+  // aborts the work because the plan does not keep it.
   const durableBoundRuns = (projection: ProjectionStore.ProjectionRuntimeRecoveryState) =>
-    Option.isSome(reattachPlan) ? DurableReattach.durableBoundRuns(projection) : [];
+    Option.isNone(reattachPlan)
+      ? Effect.succeed([])
+      : Effect.filter(DurableReattach.durableBoundRuns(projection), ({ run }) =>
+          projections
+            .hasUnpairedRunInterruptRequest(
+              projection.thread.id,
+              ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-request" }),
+              ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-result" }),
+            )
+            .pipe(
+              Effect.map((stopped) => !stopped),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderRuntimeRecoveryError({
+                    operation: "read-projections",
+                    threadId: projection.thread.id,
+                    cause,
+                  }),
+              ),
+            ),
+        );
   const startupReattached: Array<DurableReattach.DurableReattachPlanEntry> = [];
   const reconcileProjection = Effect.fn("ProviderRuntimeRecoveryService.reconcileProjection")(
     function* (
@@ -194,7 +217,7 @@ export const make = Effect.gen(function* () {
       // are left running, with their items and provider thread, and startup
       // reattaches them. Shutdown leaves them too, or startup would find them
       // already cancelled.
-      const reattached = durableBoundRuns(projection);
+      const reattached = yield* durableBoundRuns(projection);
       const reattachedRunIds = new Set(reattached.map(({ run }) => run.id));
       const reattachedProviderThreadIds = new Set(
         reattached.flatMap(({ run }) =>
@@ -859,7 +882,7 @@ export const make = Effect.gen(function* () {
         const run = restartContinuationRun(projection);
         if (!run) return;
         // A durable run continues by reattaching, not by a new run.
-        if (durableBoundRuns(projection).some((bound) => bound.run.id === run.id)) return;
+        if ((yield* durableBoundRuns(projection)).some((bound) => bound.run.id === run.id)) return;
         const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
         yield* eventSink.writeWithEffects({
           commandId,
