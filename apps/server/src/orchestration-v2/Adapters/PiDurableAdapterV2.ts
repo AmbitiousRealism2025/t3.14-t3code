@@ -1890,10 +1890,37 @@ export function makePiDurableAdapterV2(
             for (const steer of adoptedSteers) {
               yield* admitReserved(turn, steer, runIsForeign ? "followUp" : "steer").pipe(
                 Effect.catch((cause) =>
-                  Effect.logWarning("A steer accepted before the restart was not admitted", {
-                    messageId: steer.messageId,
-                    cause,
-                  }),
+                  // After a Stop nothing more is owed. Otherwise the message
+                  // stays in the thread, so say in the turn that it was not
+                  // delivered rather than drop it silently; the run goes on.
+                  turn.interrupted
+                    ? Effect.void
+                    : Effect.gen(function* () {
+                        yield* Effect.logWarning(
+                          "A steer accepted before the restart was not admitted",
+                          { messageId: steer.messageId, cause },
+                        );
+                        const at = yield* DateTime.now;
+                        const itemId = `${turn.providerTurn.id}:steer-not-delivered:${steer.messageId}`;
+                        yield* permit.withPermits(1)(
+                          emit({
+                            type: "turn_item.updated",
+                            driver: PI_PROVIDER,
+                            turnItem: {
+                              ...baseItemFields(turn, itemId, at, at),
+                              status: "failed",
+                              title: "Message not delivered",
+                              completedAt: at,
+                              type: "error",
+                              failure: makeProviderFailure({
+                                cause,
+                                message:
+                                  "A message sent just before the server restarted could not be delivered to the agent. Send it again.",
+                              }),
+                            },
+                          }),
+                        );
+                      }),
                 ),
               );
             }

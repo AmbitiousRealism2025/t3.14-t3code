@@ -1156,4 +1156,39 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a steer the provider refuses on reattach is shown as not delivered", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: { run: { inputs: [5] } } }),
+        "conversation.submit": (params) =>
+          String(params["requestId"]).endsWith(":1")
+            ? Effect.succeed({ submissionId: 5, status: "placed" })
+            : Effect.fail(new PiDurableWorkerError({ detail: "refused", errorName: "Refused" })),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 5, status: "placed", entry: 10 } }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      yield* runtime.startTurn({
+        ...input,
+        reattach: {
+          startedAt: null,
+          steers: [{ ...input.message, messageId: `message:${THREAD_ID}:2` as never }],
+        },
+      });
+      // The thread says the steer did not reach the agent.
+      yield* next(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "error" &&
+          event.turnItem.title === "Message not delivered",
+      );
+      // The run itself goes on and settles on its input.
+      yield* fake.push(settled(5));
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });
