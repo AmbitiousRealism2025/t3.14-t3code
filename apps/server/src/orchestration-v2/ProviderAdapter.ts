@@ -407,8 +407,14 @@ export interface ProviderAdapterV2TurnInput {
    * running it. Adopt the running work under this attempt instead of
    * submitting the message as new input. `startedAt` is the provider turn's
    * original start, so its duration includes the time before the restart.
+   * `steers` are the messages T3 accepted as steering for this turn; the
+   * adapter admits any the provider does not hold yet, so a steer accepted
+   * just before the restart is not lost.
    */
-  readonly reattach?: { readonly startedAt: OrchestrationV2ProviderTurn["startedAt"] };
+  readonly reattach?: {
+    readonly startedAt: OrchestrationV2ProviderTurn["startedAt"];
+    readonly steers?: ReadonlyArray<ProviderAdapterV2TurnMessage>;
+  };
   readonly attemptId: RunAttemptId;
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;

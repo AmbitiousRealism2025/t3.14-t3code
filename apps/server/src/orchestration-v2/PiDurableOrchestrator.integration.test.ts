@@ -506,6 +506,64 @@ describe.skipIf(WORKER_CLI === undefined)(
         ),
     );
 
+    it.effect("a steer sent just before a restart is answered once, in the same run", () =>
+      Effect.gen(function* () {
+        const box = yield* sandbox;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const input = yield* materialize([
+          { type: "message", text: "slow: keep going" },
+          { type: "steer", text: "and then this", targetRunIndex: 1 },
+        ]);
+        const threadId = input.projectionThreadIds[0]!;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        // Everything up to the steer's dispatch; its delivery may or may not
+        // run before the server stops.
+        const steerAt = input.steps.findIndex(
+          (step) =>
+            step.type === "dispatch" &&
+            step.command.type === "message.dispatch" &&
+            step.command.dispatchMode?.type === "steer_active",
+        );
+        assert.isAbove(steerAt, 0);
+        yield* run(
+          box,
+          "before-restart",
+          input.steps.slice(0, steerAt + 1),
+          input.projectionThreadIds,
+          {
+            tokensPerSecond: 20,
+          },
+        );
+        yield* TestClock.adjust("1 second");
+        const recovered = yield* run(
+          box,
+          "recovered",
+          [{ type: "await_run_status", threadId, runId, status: "completed" }],
+          input.projectionThreadIds,
+          { recoverOnStartup: true, tokensPerSecond: 200 },
+        );
+        const projection = projectionFor(recovered, SCENARIO);
+        assert.deepEqual(
+          projection.runs.map((entry) => entry.status),
+          ["completed"],
+        );
+        assert.include(assistantTexts(projection), "echo: and then this");
+        const transcript = yield* durableTranscript(
+          box,
+          projection.providerThreads[0]?.nativeThreadRef?.nativeId ?? "",
+        );
+        assert.deepEqual(
+          transcript.flatMap((entry) => (entry.role === "user" ? [entry.text] : [])),
+          ["slow: keep going", "and then this"],
+          "the steer reached the durable store exactly once",
+        );
+      }).pipe(
+        Effect.scoped,
+        provideDeterministicTestRuntime,
+        Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer)),
+      ),
+    );
+
     it.effect("a second restart while the reattached run streams reattaches it again", () =>
       Effect.gen(function* () {
         const box = yield* sandbox;

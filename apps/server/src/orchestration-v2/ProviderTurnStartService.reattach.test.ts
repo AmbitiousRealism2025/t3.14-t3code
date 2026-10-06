@@ -132,6 +132,15 @@ const projectionWith = (input: {
         nodeId: answerNodeId,
         streaming: true,
       },
+      // Steers accepted for this run, and one that moved on to another run.
+      { id: MessageId.make("message_steer_2"), runId, text: "second steer", attachments: [] },
+      { id: MessageId.make("message_steer_1"), runId, text: "first steer", attachments: [] },
+      {
+        id: MessageId.make("message_steer_other"),
+        runId: laterRunId,
+        text: "elsewhere",
+        attachments: [],
+      },
     ],
     checkpointScopes: [{ id: CheckpointScopeId.make("scope_reattach") }],
     turnItems: [
@@ -143,6 +152,22 @@ const projectionWith = (input: {
         status: "running",
         ordinal: 101,
       },
+      ...(
+        [
+          ["message_reattach", runId, "turn_start", 100],
+          ["message_steer_2", runId, "steer", 103],
+          ["message_steer_1", runId, "promoted_queued_to_steer", 102],
+          ["message_steer_other", laterRunId, "steer", 104],
+        ] as const
+      ).map(([messageId, itemRunId, inputIntent, ordinal]) => ({
+        id: TurnItemId.make(`turn_item_${messageId}`),
+        runId: itemRunId,
+        type: "user_message",
+        status: "completed",
+        messageId: MessageId.make(messageId),
+        inputIntent,
+        ordinal,
+      })),
     ],
     contextHandoffs: [],
     contextTransfers: [],
@@ -393,8 +418,20 @@ it.effect("an adopted run keeps its work", () =>
     yield* test.reattach;
     assert.strictEqual(test.started(), 1);
     assert.deepEqual(test.abandoned, []);
-    // The adopted turn keeps the start it had before the restart.
-    assert.deepEqual(test.reattachedFrom(), { startedAt: turnStartedAt });
+    // The adopted turn keeps the start it had before the restart, and gets the
+    // run's steers in the order they were accepted.
+    const reattachedFrom = test.reattachedFrom() as {
+      readonly startedAt: unknown;
+      readonly steers: ReadonlyArray<{ readonly messageId: string; readonly text: string }>;
+    };
+    assert.deepEqual(reattachedFrom.startedAt, turnStartedAt);
+    assert.deepEqual(
+      reattachedFrom.steers.map((steer) => [steer.messageId, steer.text]),
+      [
+        ["message_steer_1", "first steer"],
+        ["message_steer_2", "second steer"],
+      ],
+    );
   }),
 );
 

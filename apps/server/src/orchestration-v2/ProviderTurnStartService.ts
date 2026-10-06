@@ -1578,6 +1578,43 @@ export const layer: Layer.Layer<
         ],
       });
       if (!attached.committed) return;
+      // Steers T3 accepted for this run. A crash cancels a steer's delivery
+      // effect with the other process-bound effects, so the adopting turn
+      // resubmits them; the provider dedupes those it already holds. A
+      // delegated completion keeps its own delivery path and is left out.
+      const steerRecords = yield* projectionStore.getThreadRecords(
+        projection.thread.id,
+        ["messages", "turnItems"],
+        { turnItemRunIds: [run.id], turnItemTypes: ["user_message"], messageRunIds: [run.id] },
+      );
+      const steers = steerRecords.turnItems
+        .flatMap((item) =>
+          item.type === "user_message" &&
+          item.runId === run.id &&
+          (item.inputIntent === "steer" || item.inputIntent === "promoted_queued_to_steer")
+            ? [item]
+            : [],
+        )
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .flatMap((item) => {
+          const steer = steerRecords.messages.find(
+            (candidate) => candidate.id === item.messageId && candidate.runId === run.id,
+          );
+          return steer === undefined || steer.delegatedCompletion !== undefined
+            ? []
+            : [
+                {
+                  messageId: steer.id,
+                  text: projectComposerContextForProvider({
+                    text: steer.text,
+                    records: steer.context?.records ?? [],
+                  }),
+                  attachments: steer.attachments,
+                  createdBy: steer.createdBy,
+                  creationSource: steer.creationSource,
+                },
+              ];
+        });
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:durable-run.reattach:${run.id}`),
         appThread: projection.thread,
@@ -1600,7 +1637,7 @@ export const layer: Layer.Layer<
         providerThread: runningProviderThread,
         attempt,
         attemptId: attempt.id,
-        reattach: { startedAt: providerTurn.startedAt },
+        reattach: { startedAt: providerTurn.startedAt, steers },
         providerTurnOrdinal: providerTurn.ordinal,
         nativeThreadHasTurns: true,
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,

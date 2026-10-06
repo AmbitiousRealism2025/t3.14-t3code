@@ -1622,6 +1622,11 @@ export function makePiDurableAdapterV2(
         message: ProviderAdapter.ProviderAdapterV2TurnMessage,
         whenBusy: "steer" | "followUp",
         adopt = false,
+        /**
+         * Runs under the permit when the admission failed, before the turn may
+         * settle: anything it emits still belongs to the turn.
+         */
+        onRefused?: (cause: unknown) => Effect.Effect<void>,
       ) {
         const admitted = yield* Effect.gen(function* () {
           // Stop and this check share the permit: a stopped turn admits nothing new.
@@ -1651,10 +1656,14 @@ export function makePiDurableAdapterV2(
             return yield* protocolError("worker returned no submission", result);
           }
           // An adopted submission may have settled before this session
-          // watched; its record also names the input's transcript entry.
-          const record = adopt
-            ? recordField(yield* call("submission.status", { submissionId }, true), "record")
-            : undefined;
+          // watched, and its record names the input's transcript entry. A
+          // repeated request ID can also return a submission that already
+          // settled: its settlement event will not come again.
+          const replyStatus = recordString(result, "status");
+          const record =
+            adopt || replyStatus === "done" || replyStatus === "unanswered"
+              ? recordField(yield* call("submission.status", { submissionId }, true), "record")
+              : undefined;
           return { submissionId, record };
         }).pipe(Effect.exit);
         yield* permit.withPermits(1)(
@@ -1671,8 +1680,15 @@ export function makePiDurableAdapterV2(
               const status = recordString(record, "status");
               const settled =
                 status === "done" || status === "unanswered" ? (record as PiRpcRecord) : null;
-              turn.submissions.set(submissionId, early ?? settled);
+              // A resubmitted ID the turn already holds keeps a record that
+              // settled while the call was in flight.
+              turn.submissions.set(
+                submissionId,
+                early ?? settled ?? turn.submissions.get(submissionId) ?? null,
+              );
               if (adopt) yield* adoptRun(turn, record);
+            } else if (onRefused !== undefined && activeTurn === turn) {
+              yield* onRefused(Cause.squash(admitted.cause));
             }
             if (activeTurn === turn) yield* settleIfDone(turn);
           }),
@@ -1769,6 +1785,7 @@ export function makePiDurableAdapterV2(
               return yield* protocolError("durable turn requested for a different conversation");
             }
             const adopt = turnInput.reattach !== undefined;
+            const adoptedSteers = turnInput.reattach?.steers ?? [];
             // Nothing enforces approvals in the durable runtime yet, so a
             // workspace-mutating tool profile runs only in Full access. Work
             // being adopted already runs under the mode it started in.
@@ -1829,7 +1846,9 @@ export function makePiDurableAdapterV2(
             yield* permit.withPermits(1)(
               Effect.gen(function* () {
                 activeTurn = turn;
-                turn.pendingAdmissions = 1;
+                // A reattached turn also reserves its steers' admissions, so it
+                // cannot end on its input before they are admitted.
+                turn.pendingAdmissions = 1 + adoptedSteers.length;
                 // Only a reattached turn adopts output from before it started.
                 if (!adopt) foreignBacklog = [];
                 yield* emit({
@@ -1848,7 +1867,7 @@ export function makePiDurableAdapterV2(
             );
             // A reattached turn resubmits its original request ID, which
             // returns the submission admitted before the restart.
-            yield* admitReserved(turn, turnInput.message, "followUp", adopt).pipe(
+            const admittedInput = admitReserved(turn, turnInput.message, "followUp", adopt).pipe(
               Effect.tapError(() =>
                 permit.withPermits(1)(
                   Effect.gen(function* () {
@@ -1871,6 +1890,49 @@ export function makePiDurableAdapterV2(
                 ),
               ),
             );
+            yield* admittedInput;
+            // Steers T3 accepted for this turn. Their request IDs return the
+            // submissions the provider already holds; a steer the restart cut
+            // off is admitted now, into this turn.
+            for (const steer of adoptedSteers) {
+              // After a Stop nothing more is owed. Otherwise the message stays
+              // in the thread, so the turn says it was not delivered rather
+              // than drop it silently; the run goes on.
+              const notDelivered = (cause: unknown) =>
+                turn.interrupted
+                  ? Effect.void
+                  : Effect.gen(function* () {
+                      yield* Effect.logWarning(
+                        "A steer accepted before the restart was not admitted",
+                        { messageId: steer.messageId, cause },
+                      );
+                      const at = yield* DateTime.now;
+                      const itemId = `${turn.providerTurn.id}:steer-not-delivered:${steer.messageId}`;
+                      yield* emit({
+                        type: "turn_item.updated",
+                        driver: PI_PROVIDER,
+                        turnItem: {
+                          ...baseItemFields(turn, itemId, at, at),
+                          status: "failed",
+                          title: "Message not delivered",
+                          completedAt: at,
+                          type: "error",
+                          failure: makeProviderFailure({
+                            cause,
+                            message:
+                              "A message sent just before the server restarted could not be delivered to the agent. Send it again.",
+                          }),
+                        },
+                      });
+                    });
+              yield* admitReserved(
+                turn,
+                steer,
+                runIsForeign ? "followUp" : "steer",
+                false,
+                notDelivered,
+              ).pipe(Effect.ignore);
+            }
           }).pipe(
             // The worker kept this conversation's work for the reattach. When
             // the turn cannot adopt it, T3 fails the run, so stop the work
