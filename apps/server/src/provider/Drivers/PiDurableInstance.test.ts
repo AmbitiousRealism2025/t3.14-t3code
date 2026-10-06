@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import { EMPTY_PI_MODEL_CAPABILITIES } from "../Layers/piThinkingCapabilities.ts";
+import { EMPTY_PI_MODEL_CAPABILITIES } from "../piThinkingCapabilities.ts";
 import { durableProviderProbe } from "./PiDurableInstance.ts";
 
 const models = [
