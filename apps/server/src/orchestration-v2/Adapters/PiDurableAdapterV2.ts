@@ -1622,6 +1622,11 @@ export function makePiDurableAdapterV2(
         message: ProviderAdapter.ProviderAdapterV2TurnMessage,
         whenBusy: "steer" | "followUp",
         adopt = false,
+        /**
+         * Runs under the permit when the admission failed, before the turn may
+         * settle: anything it emits still belongs to the turn.
+         */
+        onRefused?: (cause: unknown) => Effect.Effect<void>,
       ) {
         const admitted = yield* Effect.gen(function* () {
           // Stop and this check share the permit: a stopped turn admits nothing new.
@@ -1682,6 +1687,8 @@ export function makePiDurableAdapterV2(
                 early ?? settled ?? turn.submissions.get(submissionId) ?? null,
               );
               if (adopt) yield* adoptRun(turn, record);
+            } else if (onRefused !== undefined && activeTurn === turn) {
+              yield* onRefused(Cause.squash(admitted.cause));
             }
             if (activeTurn === turn) yield* settleIfDone(turn);
           }),
@@ -1888,41 +1895,43 @@ export function makePiDurableAdapterV2(
             // submissions the provider already holds; a steer the restart cut
             // off is admitted now, into this turn.
             for (const steer of adoptedSteers) {
-              yield* admitReserved(turn, steer, runIsForeign ? "followUp" : "steer").pipe(
-                Effect.catch((cause) =>
-                  // After a Stop nothing more is owed. Otherwise the message
-                  // stays in the thread, so say in the turn that it was not
-                  // delivered rather than drop it silently; the run goes on.
-                  turn.interrupted
-                    ? Effect.void
-                    : Effect.gen(function* () {
-                        yield* Effect.logWarning(
-                          "A steer accepted before the restart was not admitted",
-                          { messageId: steer.messageId, cause },
-                        );
-                        const at = yield* DateTime.now;
-                        const itemId = `${turn.providerTurn.id}:steer-not-delivered:${steer.messageId}`;
-                        yield* permit.withPermits(1)(
-                          emit({
-                            type: "turn_item.updated",
-                            driver: PI_PROVIDER,
-                            turnItem: {
-                              ...baseItemFields(turn, itemId, at, at),
-                              status: "failed",
-                              title: "Message not delivered",
-                              completedAt: at,
-                              type: "error",
-                              failure: makeProviderFailure({
-                                cause,
-                                message:
-                                  "A message sent just before the server restarted could not be delivered to the agent. Send it again.",
-                              }),
-                            },
+              // After a Stop nothing more is owed. Otherwise the message stays
+              // in the thread, so the turn says it was not delivered rather
+              // than drop it silently; the run goes on.
+              const notDelivered = (cause: unknown) =>
+                turn.interrupted
+                  ? Effect.void
+                  : Effect.gen(function* () {
+                      yield* Effect.logWarning(
+                        "A steer accepted before the restart was not admitted",
+                        { messageId: steer.messageId, cause },
+                      );
+                      const at = yield* DateTime.now;
+                      const itemId = `${turn.providerTurn.id}:steer-not-delivered:${steer.messageId}`;
+                      yield* emit({
+                        type: "turn_item.updated",
+                        driver: PI_PROVIDER,
+                        turnItem: {
+                          ...baseItemFields(turn, itemId, at, at),
+                          status: "failed",
+                          title: "Message not delivered",
+                          completedAt: at,
+                          type: "error",
+                          failure: makeProviderFailure({
+                            cause,
+                            message:
+                              "A message sent just before the server restarted could not be delivered to the agent. Send it again.",
                           }),
-                        );
-                      }),
-                ),
-              );
+                        },
+                      });
+                    });
+              yield* admitReserved(
+                turn,
+                steer,
+                runIsForeign ? "followUp" : "steer",
+                false,
+                notDelivered,
+              ).pipe(Effect.ignore);
             }
           }).pipe(
             // The worker kept this conversation's work for the reattach. When

@@ -1191,4 +1191,37 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a refused steer is reported before a turn whose input already settled ends", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () => Effect.succeed({ snapshot: {} }),
+        // The input was answered before the restart; the steer is refused.
+        "conversation.submit": (params) =>
+          String(params["requestId"]).endsWith(":1")
+            ? Effect.succeed({ submissionId: 5, status: "done" })
+            : Effect.fail(new PiDurableWorkerError({ detail: "refused", errorName: "Refused" })),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 5, status: "done", entry: 10, answer: 11 } }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      const input = yield* turnInput(providerThread);
+      yield* runtime.startTurn({
+        ...input,
+        reattach: {
+          startedAt: null,
+          steers: [{ ...input.message, messageId: `message:${THREAD_ID}:2` as never }],
+        },
+      });
+      const isNotDelivered = (event: ProviderAdapterV2Event) =>
+        event.type === "turn_item.updated" &&
+        event.turnItem.type === "error" &&
+        event.turnItem.title === "Message not delivered";
+      const first = yield* next((event) => isTerminal(event) || isNotDelivered(event));
+      assert.isTrue(isNotDelivered(first), "run execution stops reading at the terminal");
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });
