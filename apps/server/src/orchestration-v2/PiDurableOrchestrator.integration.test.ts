@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - A local OpenAI-compatible endpoint stands in for a real provider.
 /**
  * The orchestrator driving a Pi-Durable instance end to end: message commands
  * go through the event sink, outbox and effect worker to the durable adapter,
@@ -9,6 +10,8 @@
  * conversation's work, and a reattach adopts it, so the run finishes under
  * its original T3 run in both stores.
  */
+import * as NodeHttp from "node:http";
+import type * as NodeNet from "node:net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -68,8 +71,18 @@ const sandbox = Effect.gen(function* () {
 
 type ReattachPlan = DurableReattach.DurableReattachPlan["Service"];
 
+/** The worker on Pi's models (`--models pi`), with Pi's agent directory in `env`. */
+interface PiWorker {
+  readonly env: Readonly<Record<string, string>>;
+}
+
 /** A registry holding one durable instance whose worker lives as long as the layer. */
-const durableRegistryLayer = (box: Box, tokensPerSecond: number, plan?: ReattachPlan) =>
+const durableRegistryLayer = (
+  box: Box,
+  tokensPerSecond: number,
+  plan?: ReattachPlan,
+  pi?: PiWorker,
+) =>
   Layer.unwrap(
     Effect.gen(function* () {
       const workers = yield* makeDurableWorkerManager({
@@ -87,9 +100,15 @@ const durableRegistryLayer = (box: Box, tokensPerSecond: number, plan?: Reattach
             "read",
             "--tokens-per-second",
             String(tokensPerSecond),
+            ...(pi === undefined ? [] : ["--models", "pi"]),
           ],
         },
-        env: { PATH: process.env.PATH, HOME: process.env.HOME, XDG_STATE_HOME: box.stateHome },
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          XDG_STATE_HOME: box.stateHome,
+          ...pi?.env,
+        },
       });
       return ProviderAdapterRegistry.makeSingleLayer(
         makePiDurableAdapterV2({
@@ -114,12 +133,13 @@ const durableRegistryLayer = (box: Box, tokensPerSecond: number, plan?: Reattach
 
 const materialize = (
   steps: Parameters<typeof materializeFixtureInput>[0]["fixtureInput"]["steps"],
+  modelSelection: ModelSelection = MODEL_SELECTION,
 ) =>
   materializeFixtureInput({
     scenario: SCENARIO,
     fixtureInput: { steps },
     driver: ProviderDriverKind.make("pi"),
-    modelSelection: MODEL_SELECTION,
+    modelSelection,
   });
 
 const run = (
@@ -131,6 +151,7 @@ const run = (
     readonly tokensPerSecond?: number;
     /** Startup recovery with a reattach plan, as server startup runs it after a restart. */
     readonly recoverOnStartup?: boolean;
+    readonly pi?: PiWorker;
     /** Runs after the steps, before this server stops. */
     readonly until?: Effect.Effect<
       void,
@@ -163,7 +184,7 @@ const run = (
         Effect.provide(
           makeOrchestratorV2ReplayLayerWithRegistry(
             scenario,
-            durableRegistryLayer(box, options.tokensPerSecond ?? 0, plan),
+            durableRegistryLayer(box, options.tokensPerSecond ?? 0, plan, options.pi),
             {
               databaseLayer,
               ...(options.recoverOnStartup === undefined
@@ -278,6 +299,59 @@ const messageSteps = (steps: ReadonlyArray<OrchestratorV2ScenarioStep>) => {
   if (firstDispatch?.type !== "dispatch") throw new Error("the scenario sends no message");
   return { firstDispatch, firstMessage, secondMessage: messageAt[1] ?? steps.length };
 };
+
+/**
+ * A local OpenAI-compatible endpoint that answers every chat completion with
+ * one streamed reply. Pi's real `openai-completions` client talks to it.
+ */
+const localOpenAiEndpoint = (reply: string) =>
+  Effect.acquireRelease(
+    Effect.promise(
+      () =>
+        new Promise<{
+          readonly server: NodeHttp.Server;
+          readonly port: number;
+          readonly models: Array<string | undefined>;
+        }>((resolve) => {
+          const models: Array<string | undefined> = [];
+          const chunk = (choices: unknown[], extra: object = {}) =>
+            `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 0, choices, ...extra })}\n\n`;
+          const server = NodeHttp.createServer((request, response) => {
+            let raw = "";
+            request.on("data", (part) => (raw += String(part)));
+            request.on("end", () => {
+              models.push((JSON.parse(raw || "{}") as { model?: string }).model);
+              response.writeHead(200, { "content-type": "text/event-stream" });
+              response.end(
+                [
+                  chunk([
+                    { index: 0, delta: { role: "assistant", content: "" }, finish_reason: null },
+                  ]),
+                  ...reply.split(" ").map((word, index) =>
+                    chunk([
+                      {
+                        index: 0,
+                        delta: { content: index === 0 ? word : ` ${word}` },
+                        finish_reason: null,
+                      },
+                    ]),
+                  ),
+                  chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+                  chunk([], {
+                    usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
+                  }),
+                  "data: [DONE]\n\n",
+                ].join(""),
+              );
+            });
+          });
+          server.listen(0, "127.0.0.1", () =>
+            resolve({ server, port: (server.address() as NodeNet.AddressInfo).port, models }),
+          );
+        }),
+    ),
+    ({ server }) => Effect.promise(() => new Promise<void>((done) => server.close(() => done()))),
+  );
 
 const assistantTexts = (projection: OrchestrationV2ThreadProjection) =>
   projection.turnItems.flatMap((item) => (item.type === "assistant_message" ? [item.text] : []));
@@ -543,6 +617,51 @@ describe.skipIf(WORKER_CLI === undefined)(
             conversationId,
           ),
         );
+      }).pipe(
+        Effect.scoped,
+        provideDeterministicTestRuntime,
+        Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer)),
+      ),
+    );
+
+    it.effect("Pi's model client streams a provider answer through the orchestrator", () =>
+      Effect.gen(function* () {
+        const box = yield* sandbox;
+        const endpoint = yield* localOpenAiEndpoint("hello from the fake model");
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        // An isolated Pi agent directory whose only provider is the local endpoint.
+        const agentDir = path.join(path.dirname(box.dataHome), "pi-agent");
+        const home = path.join(path.dirname(box.dataHome), "user-home");
+        yield* fs.makeDirectory(agentDir, { recursive: true });
+        yield* fs.makeDirectory(home, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(agentDir, "models.json"),
+          encodeJson({
+            providers: {
+              fakeai: {
+                baseUrl: `http://127.0.0.1:${endpoint.port}/v1`,
+                api: "openai-completions",
+                apiKey: "test-key",
+                models: [{ id: "fake-1", name: "Fake One", contextWindow: 32000 }],
+              },
+            },
+          }),
+        );
+        const input = yield* materialize([{ type: "message", text: "say hello" }], {
+          instanceId: INSTANCE_ID,
+          model: "fakeai/fake-1",
+        });
+        const result = yield* run(box, "pi-models", input.steps, input.projectionThreadIds, {
+          pi: { env: { HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" } },
+        });
+        const projection = projectionFor(result, SCENARIO);
+        assert.deepEqual(
+          projection.runs.map((entry) => entry.status),
+          ["completed"],
+        );
+        assert.deepEqual(assistantTexts(projection), ["hello from the fake model"]);
+        assert.deepEqual(endpoint.models, ["fake-1"], "one provider call, to the selected model");
       }).pipe(
         Effect.scoped,
         provideDeterministicTestRuntime,
