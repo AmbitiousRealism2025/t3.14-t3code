@@ -1283,9 +1283,9 @@ export const layer: Layer.Layer<
       const run = projection.runs.find((candidate) => candidate.id === runId);
       if (run === undefined) return;
       // The worker kept this run's conversation running for the reattach.
-      // When the run ended first (Stop, thread deletion) or loses ownership
-      // during it, nothing will adopt that work, so it is stopped. A newer
-      // run on the thread may be using the conversation; then it is left.
+      // When the run ended first (Stop, thread deletion), loses ownership
+      // during it, or fails, nothing will adopt that work, so it is stopped.
+      // A newer run on the same conversation may be using it; then it is left.
       const abandonKeptWork = Effect.gen(function* () {
         if (Option.isNone(reattachPlan)) return;
         const nativeId = projection.providerThreads.find(
@@ -1294,13 +1294,20 @@ export const layer: Layer.Layer<
         const conversation = nativeId == null ? undefined : parseDurableThreadRef(nativeId);
         if (conversation === undefined) return;
         const current = yield* projectionStore.getRuntimeRecoveryProjection(input.threadId);
+        const onConversation = new Set(
+          current.providerThreads.flatMap((candidate) =>
+            candidate.nativeThreadRef?.nativeId === nativeId ? [candidate.id] : [],
+          ),
+        );
         const superseded = current.runs.some(
           (candidate) =>
             candidate.id !== runId &&
-            (candidate.status === "starting" || candidate.status === "running"),
+            (candidate.status === "starting" || candidate.status === "running") &&
+            candidate.providerThreadId !== null &&
+            onConversation.has(candidate.providerThreadId),
         );
         if (superseded) return;
-        yield* Effect.logWarning("Stopping durable work whose run ended before its reattach", {
+        yield* Effect.logWarning("Stopping durable work that no reattach adopted", {
           runId,
         });
         yield* reattachPlan.value.abandon(run.providerInstanceId, conversation);
@@ -1461,6 +1468,7 @@ export const layer: Layer.Layer<
             expectedStatus: "running",
             events,
           });
+          yield* abandonKeptWork;
         });
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
         thread: projection.thread,

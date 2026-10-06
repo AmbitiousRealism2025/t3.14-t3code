@@ -51,9 +51,13 @@ const providerSessionId = ProviderSessionId.make("provider_session_reattach");
 const instanceId = ProviderInstanceId.make("pi-durable");
 const pi = ProviderDriverKind.make("pi");
 
+const otherProviderThreadId = ProviderThreadId.make("provider_thread_other");
+
 const projectionWith = (input: {
   readonly runStatus: string;
   readonly laterRunStatus?: string;
+  /** The newer run uses another provider thread (another conversation or provider). */
+  readonly laterRunElsewhere?: boolean;
 }) => {
   const providerThread = {
     id: providerThreadId,
@@ -79,7 +83,15 @@ const projectionWith = (input: {
       },
       ...(input.laterRunStatus === undefined
         ? []
-        : [{ id: laterRunId, status: input.laterRunStatus, ordinal: 2 }]),
+        : [
+            {
+              id: laterRunId,
+              status: input.laterRunStatus,
+              ordinal: 2,
+              providerThreadId:
+                input.laterRunElsewhere === true ? otherProviderThreadId : providerThreadId,
+            },
+          ]),
     ],
     nodes: [
       {
@@ -91,7 +103,14 @@ const projectionWith = (input: {
       { id: answerNodeId, runId, status: "running" },
     ],
     attempts: [{ id: attemptId, runId, status: "running" }],
-    providerThreads: [providerThread],
+    providerThreads: [
+      providerThread,
+      {
+        id: otherProviderThreadId,
+        driver: ProviderDriverKind.make("codex"),
+        nativeThreadRef: { driver: "codex", nativeId: "thr_other", strength: "strong" },
+      },
+    ],
     providerTurns: [
       {
         id: ProviderTurnId.make("provider_turn_reattach"),
@@ -130,6 +149,7 @@ const harness = (input: {
   readonly projection: OrchestrationV2ThreadProjection;
   readonly attachCommits?: boolean;
   readonly resumeFails?: boolean;
+  readonly openFails?: boolean;
 }) => {
   const abandoned: Array<DurableReattach.DurableConversationRef> = [];
   const writes: Array<ReadonlyArray<OrchestrationV2DomainEvent>> = [];
@@ -173,7 +193,10 @@ const harness = (input: {
           getRuntimeRecoveryProjection: () => Effect.succeed(input.projection),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
-          open: () => Effect.succeed(session as never),
+          open: () =>
+            input.openFails === true
+              ? Effect.fail(new Error("attachment store unavailable") as never)
+              : Effect.succeed(session as never),
         }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({}),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({
@@ -228,6 +251,33 @@ it.effect("a newer run on the thread keeps the conversation running", () =>
     });
     yield* test.reattach;
     assert.deepEqual(test.abandoned, []);
+  }),
+);
+
+it.effect("a newer run on another provider thread does not protect the kept work", () =>
+  Effect.gen(function* () {
+    const test = harness({
+      projection: projectionWith({
+        runStatus: "interrupted",
+        laterRunStatus: "running",
+        laterRunElsewhere: true,
+      }),
+    });
+    yield* test.reattach;
+    assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
+  }),
+);
+
+it.effect("a final failed session open fails the run and stops the kept work", () =>
+  Effect.gen(function* () {
+    const test = harness({ projection: projectionWith({ runStatus: "running" }), openFails: true });
+    yield* test.reattach;
+    assert.isTrue(
+      test.writes
+        .flat()
+        .some((event) => event.type === "run.updated" && event.payload.status === "failed"),
+    );
+    assert.deepEqual(test.abandoned, [{ storeId: STORE_ID, conversationId: 7 }]);
   }),
 );
 
