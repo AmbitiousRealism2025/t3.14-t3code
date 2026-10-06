@@ -183,27 +183,45 @@ export const make = Effect.gen(function* () {
   // A run the user stopped before the restart is not reattached, even when
   // the Stop's effect never ran: it is cancelled as stock, and its worker
   // aborts the work because the plan does not keep it.
+  // The recovery projection holds only open provider turns; a turn that
+  // settled just before the crash is read from the thread's records.
+  const withSettledProviderTurns = (projection: ProjectionStore.ProjectionRuntimeRecoveryState) =>
+    !DurableReattach.hasRunningDurableRun(projection)
+      ? Effect.succeed(projection)
+      : projections.getThreadRecords(projection.thread.id, ["providerTurns"]).pipe(
+          Effect.map((records) => ({ ...projection, providerTurns: records.providerTurns })),
+          Effect.mapError(
+            (cause) =>
+              new ProviderRuntimeRecoveryError({
+                operation: "read-projections",
+                threadId: projection.thread.id,
+                cause,
+              }),
+          ),
+        );
   const durableBoundRuns = (projection: ProjectionStore.ProjectionRuntimeRecoveryState) =>
     Option.isNone(reattachPlan)
       ? Effect.succeed([])
-      : Effect.filter(DurableReattach.durableBoundRuns(projection), ({ run }) =>
-          projections
-            .hasUnpairedRunInterruptRequest(
-              projection.thread.id,
-              ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-request" }),
-              ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-result" }),
-            )
-            .pipe(
-              Effect.map((stopped) => !stopped),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderRuntimeRecoveryError({
-                    operation: "read-projections",
-                    threadId: projection.thread.id,
-                    cause,
-                  }),
+      : Effect.flatMap(withSettledProviderTurns(projection), (complete) =>
+          Effect.filter(DurableReattach.durableBoundRuns(complete), ({ run }) =>
+            projections
+              .hasUnpairedRunInterruptRequest(
+                projection.thread.id,
+                ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-request" }),
+                ids.derive.runSignalTurnItem({ runId: run.id, signal: "interrupt-result" }),
+              )
+              .pipe(
+                Effect.map((stopped) => !stopped),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderRuntimeRecoveryError({
+                      operation: "read-projections",
+                      threadId: projection.thread.id,
+                      cause,
+                    }),
+                ),
               ),
-            ),
+          ),
         );
   const startupReattached: Array<DurableReattach.DurableReattachPlanEntry> = [];
   const reconcileProjection = Effect.fn("ProviderRuntimeRecoveryService.reconcileProjection")(

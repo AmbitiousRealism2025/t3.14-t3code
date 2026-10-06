@@ -128,6 +128,8 @@ const recoveryLayer = (input: {
   readonly cancelUnsettled?: EffectOutbox.EffectOutboxV2["Service"]["cancelUnsettled"];
   /** The user pressed Stop and the restart came before its effect ran. */
   readonly stopRequested?: boolean;
+  /** Provider turns in the thread's records; the recovery projection holds only open ones. */
+  readonly recordedProviderTurns?: OrchestrationV2ThreadProjection["providerTurns"];
 }) =>
   ProviderRuntimeRecovery.layer.pipe(
     Layer.provide(ServerSettings.layerTest()),
@@ -137,6 +139,11 @@ const recoveryLayer = (input: {
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(input.projection),
           hasUnpairedRunInterruptRequest: () => Effect.succeed(input.stopRequested === true),
+          getThreadRecords: () =>
+            Effect.succeed({
+              thread: input.projection.thread,
+              providerTurns: input.recordedProviderTurns ?? input.projection.providerTurns,
+            } as never),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           commitCommand: (commit) => {
@@ -474,4 +481,36 @@ it.effect("a run stopped before the restart is cancelled, not reattached", () =>
     // Its worker is not told to keep the work, so it aborts it.
     assert.deepEqual(yield* plan.conversationsFor(durableInstance), []);
   }),
+);
+
+it.effect(
+  "a provider turn that settled just before the crash is read from the thread's records",
+  () =>
+    Effect.gen(function* () {
+      const plan = yield* DurableReattach.make;
+      const commits: Array<CommitInput> = [];
+      const writes: Array<WriteInput> = [];
+      const projection = recoveryProjection({ withCodexRun: false });
+      yield* Effect.gen(function* () {
+        yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).recover;
+      }).pipe(
+        Effect.provide(
+          recoveryLayer({
+            // Like the store: the recovery projection leaves settled turns out.
+            projection: { ...projection, providerTurns: [] },
+            recordedProviderTurns: projection.providerTurns.map((turn) => ({
+              ...turn,
+              status: "completed" as const,
+            })),
+            plan,
+            commits,
+            writes,
+          }),
+        ),
+      );
+      assert.lengthOf(runEvents(commits[0], durableRun), 0, "not cancelled");
+      assert.deepEqual(yield* plan.conversationsFor(durableInstance), [
+        { storeId: STORE_ID, conversationId: 7 },
+      ]);
+    }),
 );

@@ -51,6 +51,27 @@ export const isAdoptableProviderTurn = (
     turn.nativeTurnRef?.strength === "strong" &&
     turn.nativeTurnRef.nativeId?.startsWith("pi-durable-submission:") === true);
 
+const durableConversationOf = (
+  providerThread: ProjectionRuntimeRecoveryState["providerThreads"][number] | undefined,
+) => {
+  const nativeId = providerThread?.nativeThreadRef?.nativeId;
+  return providerThread?.driver === "pi" && nativeId != null
+    ? parseDurableThreadRef(nativeId)
+    : undefined;
+};
+
+/** Whether any running run is on a provider thread bound to a durable conversation. */
+export const hasRunningDurableRun = (
+  projection: Pick<ProjectionRuntimeRecoveryState, "runs" | "providerThreads">,
+) =>
+  projection.runs.some(
+    (run) =>
+      run.status === "running" &&
+      durableConversationOf(
+        projection.providerThreads.find((candidate) => candidate.id === run.providerThreadId),
+      ) !== undefined,
+  );
+
 /**
  * Runs the durable worker may still own: `running`, with an adoptable
  * provider turn on the active attempt, on a provider thread bound to a
@@ -61,14 +82,9 @@ export function durableBoundRuns(
 ): ReadonlyArray<DurableBoundRun> {
   return projection.runs.flatMap((run) => {
     if (run.status !== "running" || run.activeAttemptId === null) return [];
-    const providerThread = projection.providerThreads.find(
-      (candidate) => candidate.id === run.providerThreadId,
+    const conversation = durableConversationOf(
+      projection.providerThreads.find((candidate) => candidate.id === run.providerThreadId),
     );
-    const nativeId = providerThread?.nativeThreadRef?.nativeId;
-    const conversation =
-      providerThread?.driver === "pi" && nativeId != null
-        ? parseDurableThreadRef(nativeId)
-        : undefined;
     if (conversation === undefined) return [];
     const attemptId = run.activeAttemptId;
     const adoptable = projection.providerTurns.some(

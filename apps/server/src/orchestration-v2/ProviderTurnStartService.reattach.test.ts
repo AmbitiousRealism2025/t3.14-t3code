@@ -195,8 +195,18 @@ const harness = (input: {
         Layer.mock(GitWorkflow.GitWorkflowService)({}),
         Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeed(Option.none()) }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          // Like the store: the root node and the input message only.
           getTurnStartContext: () =>
-            Effect.succeed({ ...input.projection, hasConversation: true } as never),
+            Effect.succeed({
+              ...input.projection,
+              nodes: input.projection.nodes.filter((node) => node.id === rootNodeId),
+              messages: input.projection.messages.filter(
+                (message) => message.id === "message_reattach",
+              ),
+              turnItems: [],
+              hasConversation: true,
+            } as never),
+          getThreadRecords: () => Effect.succeed(input.current ?? input.projection),
           getRuntimeRecoveryProjection: () => Effect.succeed(input.current ?? input.projection),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({

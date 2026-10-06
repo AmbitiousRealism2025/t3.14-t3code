@@ -1430,11 +1430,17 @@ export const layer: Layer.Layer<
                 } satisfies OrchestrationV2DomainEvent;
               }),
           );
-          // Output projected before the restart must not stay live on a failed run.
+          // Output projected before the restart must not stay live on a failed
+          // run. The turn-start context holds only the root node and the input,
+          // so the run's own records are read here.
           const open = DurableReattach.settledOpenRunOutput({
             runId,
             rootNodeId: rootNode.id,
-            projection,
+            projection: yield* projectionStore.getThreadRecords(
+              projection.thread.id,
+              ["messages", "turnItems", "nodes"],
+              { messageRunIds: [runId], turnItemRunIds: [runId] },
+            ),
             now,
           });
           const shared = {

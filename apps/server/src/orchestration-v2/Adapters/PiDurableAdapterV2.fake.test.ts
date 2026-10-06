@@ -1004,4 +1004,44 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a steer that settles while the reattach is adopting stays the turn's", () =>
+    Effect.gen(function* () {
+      const statusAsked = yield* Deferred.make<void>();
+      const adopt = yield* Deferred.make<void>();
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () =>
+          Effect.succeed({
+            snapshot: { run: { inputs: [5] }, inbox: [{ id: 7, mode: "followUp" }] },
+          }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 5, status: "placed" }),
+        "submission.status": () =>
+          Deferred.succeed(statusAsked, undefined).pipe(
+            Effect.andThen(Deferred.await(adopt)),
+            Effect.as({ record: { id: 5, status: "placed", entry: 10 } }),
+          ),
+      });
+      const { runtime, seen, next, providerThread } = yield* openRuntime(fake.worker);
+      const starting = yield* runtime
+        .startTurn({ ...(yield* turnInput(providerThread)), reattach: true })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(statusAsked);
+      // Both runs finish before the turn has adopted them.
+      yield* fake.push(
+        settled(5),
+        { type: "run_end", inputs: [5] },
+        { type: "run_start", inputs: [7] },
+        marker("the steer's answer"),
+        settled(7),
+        { type: "run_end", inputs: [7] },
+      );
+      yield* fake.drained;
+      yield* Deferred.succeed(adopt, undefined);
+      yield* Fiber.join(starting);
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+      assert.isTrue(seen.some(isMarker("the steer's answer")), "the steer's output is kept");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });

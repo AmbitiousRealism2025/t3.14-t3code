@@ -671,6 +671,8 @@ export function makePiDurableAdapterV2(
        * what the run wrote before this session watched, the backlog the rest.
        */
       let boundSnapshot: unknown = undefined;
+      /** Submissions live in the conversation when the watch began: a reattached turn's own. */
+      let liveAtBind: ReadonlySet<number> = new Set();
       let foreignBacklog: Array<{
         readonly runInputs: ReadonlyArray<number>;
         readonly event: PiRpcRecord;
@@ -1360,6 +1362,7 @@ export function makePiDurableAdapterV2(
         for (const own of activeTurn?.submissions.keys() ?? []) foreignSubmissions.delete(own);
         recomputeRunIsForeign();
         boundSnapshot = snapshot;
+        liveAtBind = new Set(foreignSubmissions);
         foreignBacklog = [];
         yield* pumpEvents(queue).pipe(Effect.forkIn(nextScope));
         yield* Scope.addFinalizer(
@@ -1511,7 +1514,13 @@ export function makePiDurableAdapterV2(
        */
       const adoptRun = Effect.fnUntraced(function* (turn: ActiveDurableTurn, record: unknown) {
         const startedAt = yield* DateTime.now;
-        for (const steer of foreignSubmissions) turn.submissions.set(steer, null);
+        // A steer that settled after the watch began has left the foreign set
+        // for the early settlements; it is still this turn's.
+        for (const steer of liveAtBind) {
+          if (turn.submissions.has(steer)) continue;
+          turn.submissions.set(steer, earlySettlements.get(steer) ?? null);
+          earlySettlements.delete(steer);
+        }
         foreignSubmissions.clear();
         recomputeRunIsForeign();
         const owned = (inputs: ReadonlyArray<unknown>) =>
