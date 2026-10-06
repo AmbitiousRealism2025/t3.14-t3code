@@ -30,7 +30,7 @@ import {
 } from "../../orchestration-v2/Adapters/PiDurableAdapterV2.ts";
 import * as ServerConfig from "../../config.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { thinkingCapabilitiesForPiModel } from "../Layers/piThinkingCapabilities.ts";
+import { thinkingCapabilitiesForPiModel } from "../piThinkingCapabilities.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,

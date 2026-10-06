@@ -28,7 +28,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
-import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerConfig from "../config.ts";
 import { makeDurableWorkerManager, makePiDurableAdapterV2 } from "./Adapters/PiDurableAdapterV2.ts";
 import * as DurableReattach from "./DurableReattach.ts";
@@ -42,7 +42,7 @@ import {
   type OrchestratorV2ScenarioStep,
 } from "./testkit/OrchestratorScenario.ts";
 import { provideDeterministicTestRuntime } from "./testkit/DeterministicRuntime.ts";
-import { makeOrchestratorV2ReplayLayerWithRegistry } from "./testkit/ProviderReplayHarness.ts";
+import { layerWithRegistry } from "./testkit/ProviderReplayHarness.ts";
 
 const WORKER_CLI = process.env.T314_WORKER_CLI;
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -110,7 +110,7 @@ const durableRegistryLayer = (
           ...pi?.env,
         },
       });
-      return ProviderAdapterRegistry.makeSingleLayer(
+      return ProviderAdapterRegistry.layerSingle(
         makePiDurableAdapterV2({
           instanceId: INSTANCE_ID,
           workers,
@@ -167,7 +167,7 @@ const run = (
     projectionThreadIds,
     runtimePolicyOverride: { cwd: box.workspace },
   };
-  const databaseLayer = makeSqlitePersistenceLive(box.database).pipe(
+  const databaseLayer = SqlitePersistence.layerFromPath(box.database).pipe(
     Layer.provide(NodeServices.layer),
   );
   return Effect.scoped(
@@ -182,7 +182,7 @@ const run = (
         return result;
       }).pipe(
         Effect.provide(
-          makeOrchestratorV2ReplayLayerWithRegistry(
+          layerWithRegistry(
             scenario,
             durableRegistryLayer(box, options.tokensPerSecond ?? 0, plan, options.pi),
             {
