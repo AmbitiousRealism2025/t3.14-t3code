@@ -1503,13 +1503,19 @@ export function makePiDurableAdapterV2(
        * this session watched, from the watch snapshot, then its output since,
        * from the backlog. Item IDs follow the same order as live mapping, so
        * items already projected before the restart are updated, not repeated.
+       *
+       * The turn also takes every submission the watch found live in the
+       * conversation: the worker kept only this run's conversation, so those
+       * are the steers it accepted before the restart, and the turn must not
+       * end before they settle.
        */
-      const adoptRun = Effect.fnUntraced(function* (
-        turn: ActiveDurableTurn,
-        submissionId: number,
-        record: unknown,
-      ) {
+      const adoptRun = Effect.fnUntraced(function* (turn: ActiveDurableTurn, record: unknown) {
         const startedAt = yield* DateTime.now;
+        for (const steer of foreignSubmissions) turn.submissions.set(steer, null);
+        foreignSubmissions.clear();
+        recomputeRunIsForeign();
+        const owned = (inputs: ReadonlyArray<unknown>) =>
+          inputs.some((input) => typeof input === "number" && turn.submissions.has(input));
         const calls = new Map<string, { readonly name: string; readonly args: unknown }>();
         const noteCalls = (content: unknown) => {
           for (const block of Array.isArray(content) ? content : []) {
@@ -1564,7 +1570,7 @@ export function makePiDurableAdapterV2(
         }
         // The answer and tools in flight when the snapshot was taken.
         const snapshotRun = recordField(recordField(boundSnapshot, "run"), "inputs");
-        if (Array.isArray(snapshotRun) && snapshotRun.includes(submissionId)) {
+        if (Array.isArray(snapshotRun) && owned(snapshotRun)) {
           const partial = recordField(recordField(boundSnapshot, "generation"), "message");
           if (recordString(partial, "role") === "assistant") {
             turn.messageOrdinal += 1;
@@ -1592,7 +1598,7 @@ export function makePiDurableAdapterV2(
         const backlog = foreignBacklog;
         foreignBacklog = [];
         for (const { runInputs, event } of backlog) {
-          if (runInputs.includes(submissionId)) yield* handleOutput(turn, event);
+          if (owned(runInputs)) yield* handleOutput(turn, event);
         }
       });
 
@@ -1657,7 +1663,7 @@ export function makePiDurableAdapterV2(
               const settled =
                 status === "done" || status === "unanswered" ? (record as PiRpcRecord) : null;
               turn.submissions.set(submissionId, early ?? settled);
-              if (adopt) yield* adoptRun(turn, submissionId, record);
+              if (adopt) yield* adoptRun(turn, record);
             }
             if (activeTurn === turn) yield* settleIfDone(turn);
           }),

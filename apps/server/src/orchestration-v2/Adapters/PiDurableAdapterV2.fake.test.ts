@@ -972,4 +972,36 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
       assert.isFalse(isTransientDurableFailure(missing), "a missing conversation stays missing");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
+
+  it.live("a reattached turn waits for the steers accepted before the restart", () =>
+    Effect.gen(function* () {
+      // Submission 6 steered the running run; 7 was queued behind it.
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        "conversation.watch": () =>
+          Effect.succeed({
+            snapshot: { run: { inputs: [5, 6] }, inbox: [{ id: 7, mode: "followUp" }] },
+          }),
+        "conversation.submit": () => Effect.succeed({ submissionId: 5, status: "placed" }),
+        "submission.status": () =>
+          Effect.succeed({ record: { id: 5, status: "placed", entry: 10 } }),
+      });
+      const { runtime, next, providerThread } = yield* openRuntime(fake.worker);
+      yield* runtime.startTurn({ ...(yield* turnInput(providerThread)), reattach: true });
+      yield* fake.push(
+        settled(5),
+        settled(6),
+        { type: "run_end", inputs: [5, 6] },
+        { type: "run_start", inputs: [7] },
+        marker("the queued steer's answer"),
+      );
+      const first = yield* next(
+        (event) => isTerminal(event) || isMarker("the queued steer's answer")(event),
+      );
+      assert.isFalse(isTerminal(first), "the turn waits for every steer and keeps their output");
+      yield* fake.push(settled(7), { type: "run_end", inputs: [7] });
+      const ended = yield* next(isTerminal);
+      assert.isTrue(ended.type === "turn.terminal" && ended.status === "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
 });
