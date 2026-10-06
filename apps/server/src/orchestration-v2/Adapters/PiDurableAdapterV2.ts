@@ -82,6 +82,26 @@ export const DURABLE_INSPECTION_RELEASE_HINT =
 
 const DURABLE_REF_PATTERN = /^pi-durable:([0-9a-f-]+):(\d+)$/;
 
+/**
+ * Whether a durable adapter failure came from a worker request that got no
+ * answer (timeout, worker gone), so the same call may still succeed. Answers
+ * the worker gave, and the adapter's own refusals, are final.
+ */
+export function isTransientDurableFailure(error: unknown): boolean {
+  for (let cause: unknown = error; typeof cause === "object" && cause !== null;) {
+    const record = cause as {
+      readonly _tag?: unknown;
+      readonly payload?: unknown;
+      readonly cause?: unknown;
+    };
+    if (record._tag === "ProviderAdapterProtocolError") {
+      return (record.payload as { readonly transient?: unknown } | undefined)?.transient === true;
+    }
+    cause = record.cause;
+  }
+  return false;
+}
+
 export function parseDurableThreadRef(
   ref: string,
 ): { readonly storeId: string; readonly conversationId: number } | undefined {
@@ -598,7 +618,7 @@ export function makePiDurableAdapterV2(
               cause.errorName === "SchedulingInhibited"
                 ? `the durable runtime is not scheduling work (${cause.detail}). ${DURABLE_INSPECTION_RELEASE_HINT}`
                 : `worker ${method} failed: ${cause.detail}`,
-              cause.errorName === undefined ? undefined : { errorName: cause.errorName },
+              cause.errorName === undefined ? { transient: true } : { errorName: cause.errorName },
             ),
           ),
         );
@@ -1693,6 +1713,20 @@ export function makePiDurableAdapterV2(
             runtimePolicy: threadInput.runtimePolicy ?? input.runtimePolicy,
             existingProviderThread: threadInput.providerThread,
           }).pipe(
+            // The worker kept this conversation's work for the reattach; the
+            // run fails after a final failed resume, so stop the work too.
+            Effect.tapError(() => {
+              const kept = parseDurableThreadRef(
+                threadInput.providerThread.nativeThreadRef?.nativeId ?? "",
+              );
+              return threadInput.reattach?.finalAttempt === true &&
+                kept !== undefined &&
+                kept.storeId === worker.status.storeId
+                ? worker
+                    .request("conversation.abort", { conversationId: kept.conversationId })
+                    .pipe(Effect.ignore)
+                : Effect.void;
+            }),
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterResumeThreadError({

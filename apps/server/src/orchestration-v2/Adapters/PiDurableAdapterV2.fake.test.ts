@@ -28,6 +28,7 @@ import * as ServerConfig from "../../config.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 import { ProviderAdapterV2RuntimePolicy, type ProviderAdapterV2Event } from "../ProviderAdapter.ts";
 import {
+  isTransientDurableFailure,
   makePiDurableAdapterV2,
   PiDurableWorkerError,
   type DurableWorker,
@@ -925,6 +926,50 @@ describe("PiDurableAdapterV2 (scripted worker)", () => {
         ),
         [CONVERSATION_ID],
       );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("a final failed reattach resume stops the kept work; an earlier one retries", () =>
+    Effect.gen(function* () {
+      let reopenFailure: PiDurableWorkerError = new PiDurableWorkerError({
+        detail: "Pi RPC conversation.open timed out",
+      });
+      const fake = yield* makeFakeWorker({
+        ...defaultHandlers,
+        // Opening the existing conversation fails; creating one works.
+        "conversation.open": (params) =>
+          params["conversationId"] === undefined
+            ? defaultHandlers["conversation.open"]!(params)
+            : Effect.fail(reopenFailure),
+      });
+      const { runtime, providerThread } = yield* openRuntime(fake.worker);
+      const aborts = () =>
+        fake.requests.filter((request) => request.method === "conversation.abort").length;
+
+      const retried = yield* runtime
+        .resumeThread({ providerThread, reattach: { finalAttempt: false } })
+        .pipe(Effect.flip);
+      assert.isTrue(isTransientDurableFailure(retried), "no worker answer: worth retrying");
+      assert.strictEqual(aborts(), 0, "a retry will still adopt the work");
+
+      yield* runtime
+        .resumeThread({ providerThread, reattach: { finalAttempt: true } })
+        .pipe(Effect.flip);
+      assert.deepStrictEqual(
+        fake.requests.flatMap((request) =>
+          request.method === "conversation.abort" ? [request.params["conversationId"]] : [],
+        ),
+        [CONVERSATION_ID],
+      );
+
+      reopenFailure = new PiDurableWorkerError({
+        detail: "conversation 7 does not exist",
+        errorName: "ConversationNotFoundError",
+      });
+      const missing = yield* runtime
+        .resumeThread({ providerThread, reattach: { finalAttempt: false } })
+        .pipe(Effect.flip);
+      assert.isFalse(isTransientDurableFailure(missing), "a missing conversation stays missing");
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

@@ -537,6 +537,12 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly threadId?: ThreadId;
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
+    /**
+     * T3.14: resuming to adopt work the provider kept across a restart. On
+     * the final attempt a failed resume stops that work, because the run
+     * that owned it is about to fail.
+     */
+    readonly reattach?: { readonly finalAttempt: boolean };
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (

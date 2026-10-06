@@ -10,6 +10,7 @@ import {
   TurnItemId,
   type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -321,5 +322,55 @@ it.effect("a running run is durable-bound while its provider turn's submission w
     assert.deepEqual(withTurnStatus("interrupted"), [durableRun]);
     // A failed turn may never have admitted its input.
     assert.deepEqual(withTurnStatus("failed"), []);
+  }),
+);
+
+it.effect("a failed reattach settles the run's open output and leaves the rest", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const rootNodeId = "node_root";
+    const projection = {
+      messages: [
+        { id: "m_streaming", runId: durableRun, nodeId: "node_answer", streaming: true },
+        { id: "m_done", runId: durableRun, nodeId: "node_old", streaming: false },
+        { id: "m_other", runId: codexRun, nodeId: null, streaming: true },
+      ],
+      turnItems: [
+        { id: "i_answer", runId: durableRun, type: "assistant_message", status: "running" },
+        { id: "i_tool", runId: durableRun, type: "dynamic_tool", status: "running" },
+        { id: "i_done", runId: durableRun, type: "dynamic_tool", status: "completed" },
+      ],
+      nodes: [
+        { id: rootNodeId, runId: durableRun, status: "running" },
+        { id: "node_answer", runId: durableRun, status: "running" },
+        { id: "node_old", runId: durableRun, status: "completed" },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const settled = DurableReattach.settledOpenRunOutput({
+      runId: durableRun,
+      rootNodeId,
+      projection,
+      now,
+    });
+    assert.deepEqual(
+      settled.messages.map((message) => [message.id, message.streaming]),
+      [["m_streaming", false]],
+    );
+    assert.deepEqual(
+      settled.turnItems.map((item): ReadonlyArray<unknown> => [
+        item.id,
+        item.status,
+        "streaming" in item ? item.streaming : undefined,
+      ]),
+      [
+        ["i_answer", "cancelled", false],
+        ["i_tool", "cancelled", undefined],
+      ],
+    );
+    assert.deepEqual(
+      settled.nodes.map((node) => [node.id, node.status]),
+      [["node_answer", "cancelled"]],
+      "the root node is settled with the run",
+    );
   }),
 );

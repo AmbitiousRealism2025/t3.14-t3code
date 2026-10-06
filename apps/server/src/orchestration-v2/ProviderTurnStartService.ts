@@ -1366,19 +1366,61 @@ export const layer: Layer.Layer<
               payload: { ...providerThread, status: "idle", updatedAt: now },
             },
           ] as const;
-          const events = yield* Effect.forEach(eventPayloads, (event) =>
-            Effect.gen(function* () {
-              return {
-                ...event,
-                id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
-                threadId: projection.thread.id,
-                runId,
-                nodeId: rootNode.id,
-                providerInstanceId: run.providerInstanceId,
-                occurredAt: now,
-              } satisfies OrchestrationV2DomainEvent;
-            }),
+          const events: Array<OrchestrationV2DomainEvent> = yield* Effect.forEach(
+            eventPayloads,
+            (event) =>
+              Effect.gen(function* () {
+                return {
+                  ...event,
+                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                  threadId: projection.thread.id,
+                  runId,
+                  nodeId: rootNode.id,
+                  providerInstanceId: run.providerInstanceId,
+                  occurredAt: now,
+                } satisfies OrchestrationV2DomainEvent;
+              }),
           );
+          // Output projected before the restart must not stay live on a failed run.
+          const open = DurableReattach.settledOpenRunOutput({
+            runId,
+            rootNodeId: rootNode.id,
+            projection,
+            now,
+          });
+          const shared = {
+            threadId: projection.thread.id,
+            runId,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+          };
+          for (const payload of open.messages) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "message.updated",
+              ...(payload.nodeId === null ? {} : { nodeId: payload.nodeId }),
+              payload,
+            });
+          }
+          for (const payload of open.turnItems) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "turn-item.updated",
+              ...(payload.nodeId === null ? {} : { nodeId: payload.nodeId }),
+              payload,
+            });
+          }
+          for (const payload of open.nodes) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "node.updated",
+              nodeId: payload.id,
+              payload,
+            });
+          }
           yield* eventSink.writeIfRunCurrent({
             threadId: projection.thread.id,
             runId,
@@ -1412,17 +1454,24 @@ export const layer: Layer.Layer<
         return;
       }
       const session = opened.success;
-      // No fresh-thread fallback and no retry: the work lives in this
-      // conversation, and a session that cannot load it never will.
+      // No fresh-thread fallback: the work lives in this conversation.
       const resumed = yield* Effect.result(
         session.resumeThread({
           providerThread,
           threadId: projection.thread.id,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
+          reattach: { finalAttempt: input.willRetry !== true },
         }),
       );
       if (resumed._tag === "Failure") {
+        // Only an unanswered worker request is retried; a missing conversation stays missing.
+        if (
+          input.willRetry === true &&
+          DurableReattach.isTransientDurableFailure(resumed.failure)
+        ) {
+          return yield* resumed.failure;
+        }
         yield* failRun(resumed.failure);
         return;
       }

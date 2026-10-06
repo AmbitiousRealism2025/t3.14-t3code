@@ -17,6 +17,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import { parseDurableThreadRef } from "./Adapters/PiDurableAdapterV2.ts";
+
+export { isTransientDurableFailure } from "./Adapters/PiDurableAdapterV2.ts";
 import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
 
 export interface DurableConversationRef {
@@ -65,6 +67,44 @@ export function durableBoundRuns(
     );
     return adoptable ? [{ run, attemptId, conversation }] : [];
   });
+}
+
+const isOpenStatus = (status: string) =>
+  status === "pending" || status === "running" || status === "waiting";
+
+/**
+ * Output a run projected before the restart that is still open: streaming
+ * messages, unsettled items and child nodes. A run whose reattach fails
+ * settles it, so the failed run shows no live indicator.
+ */
+export function settledOpenRunOutput(input: {
+  readonly runId: RunId;
+  readonly rootNodeId: string;
+  readonly projection: Pick<ProjectionRuntimeRecoveryState, "messages" | "turnItems" | "nodes">;
+  readonly now: DateTime.Utc;
+}) {
+  const { runId, now } = input;
+  return {
+    messages: input.projection.messages
+      .filter((message) => message.runId === runId && message.streaming)
+      .map((message) => ({ ...message, streaming: false, updatedAt: now })),
+    turnItems: input.projection.turnItems
+      .filter((item) => item.runId === runId && isOpenStatus(item.status))
+      .map((item) => ({
+        ...item,
+        status: "cancelled" as const,
+        completedAt: now,
+        updatedAt: now,
+        ...(item.type === "reasoning" || item.type === "assistant_message"
+          ? { streaming: false }
+          : {}),
+      })),
+    nodes: input.projection.nodes
+      .filter(
+        (node) => node.runId === runId && node.id !== input.rootNodeId && isOpenStatus(node.status),
+      )
+      .map((node) => ({ ...node, status: "cancelled" as const, completedAt: now })),
+  };
 }
 
 /**
