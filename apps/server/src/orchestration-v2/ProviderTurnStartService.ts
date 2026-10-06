@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -23,6 +24,8 @@ import * as Schema from "effect/Schema";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/Services/ProviderAuthService.ts";
+import { parseDurableThreadRef } from "./Adapters/PiDurableAdapterV2.ts";
+import * as DurableReattach from "./DurableReattach.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
@@ -74,6 +77,16 @@ export interface ProviderTurnStartServiceV2Shape {
     readonly runId: RunId;
     readonly willRetry?: boolean;
   }) => Effect.Effect<void, ProviderTurnStartError>;
+  /**
+   * T3.14: adopts a running run whose provider turn the durable worker kept
+   * across a restart. The session resumes its conversation; when that fails
+   * the run fails, because a new conversation would not hold the work.
+   */
+  readonly reattach: (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly willRetry?: boolean;
+  }) => Effect.Effect<void, ProviderTurnStartError>;
 }
 
 export class ProviderTurnStartServiceV2 extends Context.Service<
@@ -108,6 +121,8 @@ export const layer: Layer.Layer<
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    // T3.14: stops durable work a reattach found nothing to adopt for (W02).
+    const reattachPlan = yield* Effect.serviceOption(DurableReattach.DurableReattachPlan);
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
 
     // These callbacks outlive startup while a run drains background work. Build
@@ -1259,15 +1274,400 @@ export const layer: Layer.Layer<
       });
     });
 
-    return ProviderTurnStartServiceV2.of({
-      start: (input) =>
-        start(input).pipe(
-          Effect.mapError((cause) =>
-            isProviderTurnStartError(cause)
-              ? cause
-              : new ProviderTurnStartError({ runId: input.runId, cause }),
+    interface ReattachState {
+      /** An adapter turn took the kept work over. */
+      adopted: boolean;
+      /** Stops the kept work, once the run and its conversation are known. */
+      abandon: Effect.Effect<void> | undefined;
+      /** Fails the run while it is still this running attempt. */
+      failRun: ((error: Error) => Effect.Effect<void, unknown>) | undefined;
+    }
+
+    const reattachOnce = Effect.fn("orchestrationV2.providerTurnStart.reattach")(function* (
+      input: {
+        readonly threadId: ThreadId;
+        readonly runId: RunId;
+        readonly willRetry?: boolean;
+      },
+      state: ReattachState,
+    ) {
+      const { runId } = input;
+      const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
+      const run = projection.runs.find((candidate) => candidate.id === runId);
+      if (run === undefined) return;
+      // A newer run on the same conversation may be using it; then it is left.
+      const abandonKeptWork = Effect.gen(function* () {
+        if (Option.isNone(reattachPlan)) return;
+        const nativeId = projection.providerThreads.find(
+          (candidate) => candidate.id === run.providerThreadId,
+        )?.nativeThreadRef?.nativeId;
+        const conversation = nativeId == null ? undefined : parseDurableThreadRef(nativeId);
+        if (conversation === undefined) return;
+        const current = yield* projectionStore.getRuntimeRecoveryProjection(input.threadId);
+        const onConversation = new Set(
+          current.providerThreads.flatMap((candidate) =>
+            candidate.nativeThreadRef?.nativeId === nativeId ? [candidate.id] : [],
           ),
+        );
+        const superseded = current.runs.some(
+          (candidate) =>
+            candidate.id !== runId &&
+            (candidate.status === "starting" || candidate.status === "running") &&
+            candidate.providerThreadId !== null &&
+            onConversation.has(candidate.providerThreadId),
+        );
+        if (superseded) return;
+        yield* Effect.logWarning("Stopping durable work that no reattach adopted", {
+          runId,
+        });
+        yield* reattachPlan.value.abandon(run.providerInstanceId, conversation);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to stop durable work kept for a reattach", { runId, cause }),
         ),
+      );
+      state.abandon = abandonKeptWork;
+      // Ended before its reattach ran (Stop, thread deletion).
+      if (run.status !== "running") return;
+      const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
+      const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
+      const providerThread = projection.providerThreads.find(
+        (candidate) => candidate.id === run.providerThreadId,
+      );
+      const providerTurn = projection.providerTurns.find(
+        (candidate) => candidate.runAttemptId === run.activeAttemptId,
+      );
+      const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+      const checkpointScope = projection.checkpointScopes.find(
+        (candidate) => candidate.id === rootNode?.checkpointScopeId,
+      );
+      const nativeThreadId = providerThread?.nativeThreadRef?.nativeId;
+      if (
+        rootNode === undefined ||
+        attempt === undefined ||
+        providerThread === undefined ||
+        providerThread.providerSessionId === null ||
+        nativeThreadId == null ||
+        providerTurn === undefined ||
+        message === undefined ||
+        checkpointScope === undefined
+      ) {
+        return yield* new ProviderTurnStartError({
+          runId,
+          cause: `Run ${runId} is missing the execution state needed to reattach it.`,
+        });
+      }
+      if (!DurableReattach.isAdoptableProviderTurn(providerTurn)) return;
+      const providerSessionId = providerThread.providerSessionId;
+      // Fails the run and its provider turn while the run is still this running attempt.
+      const failRun = (error: Error) =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now;
+          const nestedCause = "cause" in error ? error.cause : undefined;
+          const failure = makeProviderFailure({
+            cause: error,
+            message:
+              nestedCause instanceof Error
+                ? nestedCause.message
+                : typeof nestedCause === "string"
+                  ? nestedCause
+                  : error.message,
+            class: "provider_error",
+          });
+          const item: OrchestrationV2TurnItem = {
+            id: idAllocator.derive.runSignalTurnItem({ runId, signal: "durable-reattach-failure" }),
+            threadId: projection.thread.id,
+            runId,
+            nodeId: rootNode.id,
+            providerThreadId: providerThread.id,
+            providerTurnId: providerTurn.id,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal:
+              Math.max(
+                0,
+                ...projection.turnItems
+                  .filter((candidate) => candidate.runId === runId)
+                  .map((candidate) => candidate.ordinal),
+              ) + 1,
+            status: "failed",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "error",
+            title: "Could not reattach the durable run",
+            failure,
+          };
+          const eventPayloads = [
+            { type: "turn-item.updated", payload: item },
+            {
+              type: "provider-turn.updated",
+              payload: { ...providerTurn, status: "failed", completedAt: now },
+            },
+            { type: "run.updated", payload: { ...run, status: "failed", completedAt: now } },
+            {
+              type: "run-attempt.updated",
+              payload: { ...attempt, status: "failed", completedAt: now },
+            },
+            { type: "node.updated", payload: { ...rootNode, status: "failed", completedAt: now } },
+            {
+              type: "provider-thread.updated",
+              payload: { ...providerThread, status: "idle", updatedAt: now },
+            },
+          ] as const;
+          const events: Array<OrchestrationV2DomainEvent> = yield* Effect.forEach(
+            eventPayloads,
+            (event) =>
+              Effect.gen(function* () {
+                return {
+                  ...event,
+                  id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+                  threadId: projection.thread.id,
+                  runId,
+                  nodeId: rootNode.id,
+                  providerInstanceId: run.providerInstanceId,
+                  occurredAt: now,
+                } satisfies OrchestrationV2DomainEvent;
+              }),
+          );
+          // Output projected before the restart must not stay live on a failed
+          // run. The turn-start context holds only the root node and the input,
+          // so the run's own records are read here.
+          const open = DurableReattach.settledOpenRunOutput({
+            runId,
+            rootNodeId: rootNode.id,
+            projection: yield* projectionStore.getThreadRecords(
+              projection.thread.id,
+              ["messages", "turnItems", "nodes"],
+              { messageRunIds: [runId], turnItemRunIds: [runId] },
+            ),
+            now,
+          });
+          const shared = {
+            threadId: projection.thread.id,
+            runId,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+          };
+          for (const payload of open.messages) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "message.updated",
+              ...(payload.nodeId === null ? {} : { nodeId: payload.nodeId }),
+              payload,
+            });
+          }
+          for (const payload of open.turnItems) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "turn-item.updated",
+              ...(payload.nodeId === null ? {} : { nodeId: payload.nodeId }),
+              payload,
+            });
+          }
+          for (const payload of open.nodes) {
+            events.push({
+              ...shared,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              type: "node.updated",
+              nodeId: payload.id,
+              payload,
+            });
+          }
+          yield* eventSink.writeIfRunCurrent({
+            threadId: projection.thread.id,
+            runId,
+            activeAttemptId: attempt.id,
+            expectedStatus: "running",
+            events,
+          });
+        });
+      state.failRun = failRun;
+      const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
+        thread: projection.thread,
+        modelSelection: run.modelSelection,
+      });
+      const existingSessionProjection = projection.providerSessions.find(
+        (candidate) => candidate.id === providerSessionId,
+      );
+      const opened = yield* Effect.result(
+        providerSessions.open({
+          threadId: projection.thread.id,
+          providerSessionId,
+          modelSelection: run.modelSelection,
+          runtimePolicy: resolvedRuntimePolicy,
+          ...(existingSessionProjection === undefined
+            ? {}
+            : { resumeFromSession: existingSessionProjection }),
+          initialNativeThreadId: nativeThreadId,
+        }),
+      );
+      if (opened._tag === "Failure") {
+        if (input.willRetry === true) return yield* opened.failure;
+        yield* failRun(opened.failure);
+        return;
+      }
+      const session = opened.success;
+      // No fresh-thread fallback: the work lives in this conversation.
+      const resumed = yield* Effect.result(
+        session.resumeThread({
+          providerThread,
+          threadId: projection.thread.id,
+          modelSelection: run.modelSelection,
+          runtimePolicy: resolvedRuntimePolicy,
+          reattach: { finalAttempt: input.willRetry !== true },
+        }),
+      );
+      if (resumed._tag === "Failure") {
+        // Only an unanswered worker request is retried; a missing conversation stays missing.
+        if (
+          input.willRetry === true &&
+          DurableReattach.isTransientDurableFailure(resumed.failure)
+        ) {
+          return yield* resumed.failure;
+        }
+        yield* failRun(resumed.failure);
+        return;
+      }
+      const loaded = resumed.success;
+      const runControls = makeRunControls({
+        threadId: projection.thread.id,
+        runId: run.id,
+        attemptId: attempt.id,
+        providerThreadId: providerThread.id,
+        runOrdinal: run.ordinal,
+        inheritedBackgroundTurnItems: [],
+      });
+      const now = yield* DateTime.now;
+      const runningProviderThread: OrchestrationV2ProviderThread = {
+        ...providerThread,
+        nativeThreadRef: loaded.nativeThreadRef ?? providerThread.nativeThreadRef,
+        providerSessionId,
+        status: "active",
+        updatedAt: now,
+      };
+      const attached = yield* eventSink.writeIfRunCurrent({
+        threadId: projection.thread.id,
+        runId: run.id,
+        activeAttemptId: attempt.id,
+        expectedStatus: "running",
+        events: [
+          {
+            id: yield* idAllocator.allocate.event({
+              threadId: projection.thread.id,
+              providerSessionId,
+            }),
+            type: "provider-session.updated",
+            threadId: projection.thread.id,
+            driver: session.driver,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: session.providerSession,
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+            type: "provider-thread.updated",
+            threadId: projection.thread.id,
+            driver: session.driver,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: runningProviderThread,
+          },
+        ],
+      });
+      if (!attached.committed) return;
+      yield* runExecution.startRootRun({
+        commandId: CommandId.make(`command:effect:durable-run.reattach:${run.id}`),
+        appThread: projection.thread,
+        providerSessionId,
+        // The adapter's turn has taken the kept work over once startTurn succeeds.
+        session: {
+          ...session,
+          startTurn: (turnInput) =>
+            session.startTurn(turnInput).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  state.adopted = true;
+                }),
+              ),
+            ),
+        },
+        run,
+        rootNode,
+        checkpointScope,
+        providerThread: runningProviderThread,
+        attempt,
+        attemptId: attempt.id,
+        reattach: true,
+        providerTurnOrdinal: providerTurn.ordinal,
+        nativeThreadHasTurns: true,
+        loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,
+        shouldStartProviderTurn: runControls.shouldStartProviderTurn,
+        shouldFinalizeRun: runControls.shouldFinalizeRun,
+        hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
+        message: {
+          messageId: message.id,
+          text: projectComposerContextForProvider({
+            text: message.text,
+            records: message.context?.records ?? [],
+          }),
+          attachments: message.attachments,
+          createdBy: message.createdBy,
+          creationSource: message.creationSource,
+        },
+        modelSelection: run.modelSelection,
+        runtimePolicy: resolvedRuntimePolicy,
+      });
+    });
+
+    /**
+     * The worker keeps a reattached run's conversation running, so a reattach
+     * ends in one of two ways: an adapter turn takes the work over, or the
+     * work is stopped. Every other outcome lands here: the run ended or was
+     * lost before adoption, or the reattach failed for good. A failure the
+     * effect will retry, and an interruption (the server stopping), leave
+     * the work for the next attempt or startup.
+     */
+    const reattach = (input: {
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly willRetry?: boolean;
+    }) =>
+      Effect.gen(function* () {
+        const state: ReattachState = { adopted: false, abandon: undefined, failRun: undefined };
+        const exit = yield* Effect.exit(reattachOnce(input, state));
+        const interrupted = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause);
+        const retrying = Exit.isFailure(exit) && input.willRetry === true;
+        if (!state.adopted && !interrupted && !retrying) {
+          if (Exit.isFailure(exit) && state.failRun !== undefined) {
+            yield* state
+              .failRun(
+                new ProviderTurnStartError({ runId: input.runId, cause: Cause.squash(exit.cause) }),
+              )
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to fail a run whose reattach failed", {
+                    runId: input.runId,
+                    cause,
+                  }),
+                ),
+              );
+          }
+          if (state.abandon !== undefined) yield* state.abandon;
+        }
+        return yield* exit;
+      });
+
+    const asTurnStartError =
+      (runId: RunId) =>
+      (cause: unknown): ProviderTurnStartError =>
+        isProviderTurnStartError(cause) ? cause : new ProviderTurnStartError({ runId, cause });
+
+    return ProviderTurnStartServiceV2.of({
+      start: (input) => start(input).pipe(Effect.mapError(asTurnStartError(input.runId))),
+      reattach: (input) => reattach(input).pipe(Effect.mapError(asTurnStartError(input.runId))),
     });
   }),
 );

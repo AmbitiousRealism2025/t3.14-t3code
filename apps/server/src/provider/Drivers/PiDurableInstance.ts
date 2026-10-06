@@ -15,9 +15,11 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
 import * as ServerSettings from "../../serverSettings.ts";
 import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+import * as DurableReattach from "../../orchestration-v2/DurableReattach.ts";
 import {
   DURABLE_INSPECTION_RELEASE_HINT,
   makeDurableWorkerManager,
@@ -142,10 +144,28 @@ export const makePiDurableProviderInstance = Effect.fnUntraced(function* (
     driverKind: DRIVER_KIND,
     instanceId,
   });
+  const reattachPlan = yield* Effect.serviceOption(DurableReattach.DurableReattachPlan);
   const workers = yield* makeDurableWorkerManager({
     launch: durable,
     env: mergeProviderInstanceEnvironment(environment),
+    // The worker keeps the conversations of runs startup recovery reattaches.
+    ...(Option.isSome(reattachPlan)
+      ? { keepConversations: reattachPlan.value.conversationsFor(instanceId) }
+      : {}),
   });
+  if (Option.isSome(reattachPlan)) {
+    // Stops kept work whose run ended before its reattach adopted it.
+    yield* reattachPlan.value.registerAbandon(instanceId, (conversation) =>
+      workers.get.pipe(
+        Effect.flatMap((worker) =>
+          worker.status.storeId === conversation.storeId
+            ? worker.request("conversation.abort", { conversationId: conversation.conversationId })
+            : Effect.void,
+        ),
+        Effect.ignore,
+      ),
+    );
+  }
   const stamp = (snapshot: Omit<ServerProvider, "instanceId" | "driver">): ServerProvider => ({
     ...snapshot,
     instanceId,

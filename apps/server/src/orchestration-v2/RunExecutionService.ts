@@ -508,6 +508,12 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly attemptId: RunAttemptId;
   readonly providerTurnOrdinal: number;
   readonly nativeThreadHasTurns?: boolean;
+  /**
+   * T3.14: adopt a provider turn that kept running across a restart. Its
+   * baseline was captured before the restart; capturing again would fold the
+   * turn's own changes into it.
+   */
+  readonly reattach?: boolean;
   readonly loadInheritedBackgroundTurnItems?: () => Effect.Effect<
     ReadonlyArray<InheritedBackgroundTurnItemRoute>,
     unknown
@@ -835,21 +841,23 @@ export const layer: Layer.Layer<
                     .responseStreamingMode,
               ),
             );
-            yield* checkpointService
-              .captureBaseline({
-                scope: input.checkpointScope,
-                ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
-              })
-              .pipe(
-                Effect.catchCause((cause) =>
-                  Cause.hasInterruptsOnly(cause)
-                    ? Effect.failCause(cause)
-                    : Effect.logWarning(
-                        "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
-                        { runId: input.run.id },
-                      ),
-                ),
-              );
+            yield* (
+              input.reattach === true
+                ? Effect.void
+                : checkpointService.captureBaseline({
+                    scope: input.checkpointScope,
+                    ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
+                  })
+            ).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logWarning(
+                      "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
+                      { runId: input.run.id },
+                    ),
+              ),
+            );
             if (
               input.shouldStartProviderTurn !== undefined &&
               !(yield* input.shouldStartProviderTurn())
@@ -1357,6 +1365,7 @@ export const layer: Layer.Layer<
               : {
                   restartContinuationOfRunId: input.run.restartContinuationOfRunId,
                 }),
+            ...(input.reattach === true ? { reattach: true } : {}),
             attemptId: input.attemptId,
             rootNodeId: input.rootNode.id,
             providerThread: input.providerThread,

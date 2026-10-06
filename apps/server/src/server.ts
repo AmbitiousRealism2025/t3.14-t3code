@@ -5,6 +5,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as PullRequestWatchReactor from "./orchestration-v2/PullRequestWatchReactor.ts";
+import * as DurableReattach from "./orchestration-v2/DurableReattach.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -572,6 +573,9 @@ const RuntimeCoreDependenciesBaseLive = Layer.mergeAll(
 
 const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   Layer.provideMerge(PtyAdapterLive),
+  // T3.14: one plan shared by startup recovery and the Pi-Durable instances,
+  // so durable runs left running across a restart are reattached (W02).
+  Layer.provideMerge(DurableReattach.layer),
   // Search, prepare, status inspection, and turn launch share one registry
   // cache so every client and provider instance sees the same prepared agents.
   Layer.provideMerge(AcpRegistryCatalogLive),

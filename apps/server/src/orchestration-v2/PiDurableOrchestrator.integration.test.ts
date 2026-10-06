@@ -4,9 +4,10 @@
  * the real T3.14 worker and its fixture model, and back into projections.
  * Runs only when `T314_WORKER_CLI` points at the worker CLI.
  *
- * The restart case covers D03 step 1: stock recovery cancels the T3 run, and
- * the restarted worker aborts the recovered durable work before it can run
- * unseen, so the two stores agree. Resuming it instead is W02.
+ * The restart cases cover W02: startup recovery leaves a run bound to a
+ * durable conversation running, the restarted worker keeps that
+ * conversation's work, and a reattach adopts it, so the run finishes under
+ * its original T3 run in both stores.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -21,12 +22,16 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import * as ServerConfig from "../config.ts";
 import { makeDurableWorkerManager, makePiDurableAdapterV2 } from "./Adapters/PiDurableAdapterV2.ts";
+import * as DurableReattach from "./DurableReattach.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as IdAllocator from "./IdAllocator.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import { materializeFixtureInput, projectionFor } from "./testkit/fixtures/shared.ts";
 import {
@@ -61,11 +66,14 @@ const sandbox = Effect.gen(function* () {
   } satisfies Box;
 });
 
+type ReattachPlan = DurableReattach.DurableReattachPlan["Service"];
+
 /** A registry holding one durable instance whose worker lives as long as the layer. */
-const durableRegistryLayer = (box: Box, tokensPerSecond: number) =>
+const durableRegistryLayer = (box: Box, tokensPerSecond: number, plan?: ReattachPlan) =>
   Layer.unwrap(
     Effect.gen(function* () {
       const workers = yield* makeDurableWorkerManager({
+        ...(plan === undefined ? {} : { keepConversations: plan.conversationsFor(INSTANCE_ID) }),
         launch: {
           command: process.execPath,
           args: [
@@ -119,7 +127,17 @@ const run = (
   name: string,
   steps: ReadonlyArray<OrchestratorV2ScenarioStep>,
   projectionThreadIds: Effect.Success<ReturnType<typeof materialize>>["projectionThreadIds"],
-  options: { readonly tokensPerSecond?: number; readonly recoverOnStartup?: boolean } = {},
+  options: {
+    readonly tokensPerSecond?: number;
+    /** Startup recovery with a reattach plan, as server startup runs it after a restart. */
+    readonly recoverOnStartup?: boolean;
+    /** Runs after the steps, before this server stops. */
+    readonly until?: Effect.Effect<
+      void,
+      Orchestrator.OrchestratorV2Error,
+      Orchestrator.OrchestratorV2
+    >;
+  } = {},
 ) => {
   const scenario = {
     name: `${SCENARIO}:${name}`,
@@ -133,26 +151,83 @@ const run = (
   );
   return Effect.scoped(
     Effect.gen(function* () {
-      if (options.recoverOnStartup === true) {
-        yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
-      }
-      return yield* runOrchestratorV2Scenario(scenario);
-    }).pipe(
-      Effect.provide(
-        makeOrchestratorV2ReplayLayerWithRegistry(
-          scenario,
-          durableRegistryLayer(box, options.tokensPerSecond ?? 0),
-          {
-            databaseLayer,
-            ...(options.recoverOnStartup === undefined
-              ? {}
-              : { recoverOnStartup: options.recoverOnStartup }),
-          },
+      const plan = options.recoverOnStartup === true ? yield* DurableReattach.make : undefined;
+      return yield* Effect.gen(function* () {
+        if (options.recoverOnStartup === true) {
+          yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+        }
+        const result = yield* runOrchestratorV2Scenario(scenario);
+        if (options.until !== undefined) yield* options.until;
+        return result;
+      }).pipe(
+        Effect.provide(
+          makeOrchestratorV2ReplayLayerWithRegistry(
+            scenario,
+            durableRegistryLayer(box, options.tokensPerSecond ?? 0, plan),
+            {
+              databaseLayer,
+              ...(options.recoverOnStartup === undefined
+                ? {}
+                : { recoverOnStartup: options.recoverOnStartup }),
+            },
+          ).pipe(
+            Layer.provide(
+              plan === undefined
+                ? Layer.empty
+                : Layer.succeed(DurableReattach.DurableReattachPlan, plan),
+            ),
+          ),
         ),
-      ),
-    ),
+      );
+    }),
   );
 };
+
+/** Waits until a session reattached after the last restart is running the thread's turn. */
+const awaitReattachedTurn = (threadId: string) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    let stopped = false;
+    yield* orchestrator.streamStoredEvents.pipe(
+      Stream.map((stored) => stored.event),
+      Stream.filter(
+        (event) => event.threadId === threadId && event.type === "provider-session.updated",
+      ),
+      Stream.takeUntil((event) => {
+        if (event.type !== "provider-session.updated") return false;
+        if (event.payload.status === "stopped") stopped = true;
+        return stopped && event.payload.status === "running";
+      }),
+      Stream.runDrain,
+    );
+  });
+
+/** Durable data held by another store: the box lost its store, or it was replaced. */
+const durableConversationExists = (
+  dataHome: string,
+  workspace: string,
+  stateHome: string,
+  conversationId: number,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const workers = yield* makeDurableWorkerManager({
+        launch: {
+          command: process.execPath,
+          args: [WORKER_CLI!, "worker", "--data-home", dataHome, "--cwd", workspace],
+        },
+        env: { PATH: process.env.PATH, HOME: process.env.HOME, XDG_STATE_HOME: stateHome },
+      });
+      const worker = yield* workers.get;
+      return yield* worker.request("conversation.entries", { conversationId }).pipe(
+        Effect.as(true),
+        Effect.catchIf(
+          (error) => error.errorName === "ConversationNotFoundError",
+          () => Effect.succeed(false),
+        ),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
 /** The durable store's own transcript, read through a fresh worker. */
 const durableTranscript = (box: Box, nativeRef: string) =>
@@ -192,6 +267,17 @@ const durableTranscript = (box: Box, nativeRef: string) =>
       });
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+/** The scenario steps around the first and second user message. */
+const messageSteps = (steps: ReadonlyArray<OrchestratorV2ScenarioStep>) => {
+  const messageAt = steps.flatMap((step, index) =>
+    step.type === "dispatch" && step.command.type === "message.dispatch" ? [index] : [],
+  );
+  const firstMessage = messageAt[0]!;
+  const firstDispatch = steps[firstMessage];
+  if (firstDispatch?.type !== "dispatch") throw new Error("the scenario sends no message");
+  return { firstDispatch, firstMessage, secondMessage: messageAt[1] ?? steps.length };
+};
 
 const assistantTexts = (projection: OrchestrationV2ThreadProjection) =>
   projection.turnItems.flatMap((item) => (item.type === "assistant_message" ? [item.text] : []));
@@ -250,31 +336,170 @@ describe.skipIf(WORKER_CLI === undefined)(
       ),
     );
 
-    it.effect("a server restart mid-turn cancels the run in both stores (D03 step 1)", () =>
+    it.effect(
+      "a server restart mid-turn reattaches the run, which finishes in both stores (W02)",
+      () =>
+        Effect.gen(function* () {
+          const box = yield* sandbox;
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          const input = yield* materialize([
+            { type: "message", text: "slow: survive the restart" },
+            { type: "message", text: "after the restart" },
+          ]);
+          const { firstDispatch, firstMessage, secondMessage } = messageSteps(input.steps);
+          const threadId = input.projectionThreadIds[0]!;
+          const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+
+          // Phase 1: the server stops while the first answer is still being generated.
+          const before = yield* run(
+            box,
+            "before-restart",
+            [
+              ...input.steps.slice(0, firstMessage),
+              { ...firstDispatch, await: false, key: "run:1" },
+              { type: "await_run_steerable", threadId, runId },
+            ],
+            input.projectionThreadIds,
+            { tokensPerSecond: 20 },
+          );
+          assert.equal(projectionFor(before, SCENARIO).runs[0]?.status, "running");
+
+          // Phase 2: startup recovery keeps the run; the reattach sees it finish.
+          yield* TestClock.adjust("1 second");
+          const recovered = yield* run(
+            box,
+            "recovered",
+            [{ type: "await_run_status", threadId, runId, status: "completed" }],
+            input.projectionThreadIds,
+            { recoverOnStartup: true, tokensPerSecond: 200 },
+          );
+          const afterRecovery = projectionFor(recovered, SCENARIO);
+
+          // Phase 3: the user sends the next message.
+          const after = yield* run(
+            box,
+            "after-restart",
+            input.steps.slice(secondMessage),
+            input.projectionThreadIds,
+          );
+          const projection = projectionFor(after, SCENARIO);
+
+          // What a restart now leaves in T3 and in the durable store.
+          const observation = {
+            runStatusesAfterRecovery: afterRecovery.runs.map((entry) => entry.status),
+            runStatusesAfterNextMessage: projection.runs.map((entry) => entry.status),
+            turnItemsAfterNextMessage: projection.turnItems.map((item) => ({
+              runId: item.runId,
+              type: item.type,
+              status: item.status,
+              ...(item.type === "assistant_message" || item.type === "user_message"
+                ? { text: item.text.length > 60 ? `${item.text.slice(0, 60)}…` : item.text }
+                : {}),
+            })),
+            providerThreads: projection.providerThreads.map(
+              (thread) => thread.nativeThreadRef?.nativeId ?? null,
+            ),
+            durableTranscript: yield* durableTranscript(
+              box,
+              projection.providerThreads[0]?.nativeThreadRef?.nativeId ?? "",
+            ),
+          };
+          const evidenceDir = process.env.T314_EVIDENCE_DIR;
+          if (evidenceDir !== undefined) {
+            const fs = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            yield* fs.writeFileString(
+              path.join(evidenceDir, "s01-orchestrator-restart.json"),
+              `${encodeJson(observation)}\n`,
+            );
+          }
+          const answer = "survive the restart ".repeat(40).trim();
+          assert.deepEqual(observation.runStatusesAfterRecovery, ["completed"]);
+          assert.deepEqual(observation.runStatusesAfterNextMessage, ["completed", "completed"]);
+          // One answer per run: the reattach updated the item projected before the restart.
+          assert.deepEqual(assistantTexts(projection), [answer, "echo: after the restart"]);
+          assert.lengthOf(projection.providerThreads, 1);
+          assert.deepEqual(
+            observation.durableTranscript.flatMap((entry) =>
+              entry.role === "assistant" && entry.stopReason === "stop" ? [entry.text] : [],
+            ),
+            [`${answer.slice(0, 60)}…`, "echo: after the restart"],
+          );
+        }).pipe(
+          Effect.scoped,
+          provideDeterministicTestRuntime,
+          Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer)),
+        ),
+    );
+
+    it.effect("a second restart while the reattached run streams reattaches it again", () =>
       Effect.gen(function* () {
         const box = yield* sandbox;
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
-        const input = yield* materialize([
-          { type: "message", text: "slow: survive the restart" },
-          { type: "message", text: "after the restart" },
-        ]);
-        const messageAt = input.steps.flatMap((step, index) =>
-          step.type === "dispatch" && step.command.type === "message.dispatch" ? [index] : [],
-        );
-        const [firstMessage, secondMessage] = messageAt;
-        const firstDispatch = firstMessage === undefined ? undefined : input.steps[firstMessage];
-        assert.isTrue(firstDispatch?.type === "dispatch" && secondMessage !== undefined);
-        if (
-          firstDispatch?.type !== "dispatch" ||
-          firstMessage === undefined ||
-          secondMessage === undefined
-        ) {
-          return;
-        }
+        const input = yield* materialize([{ type: "message", text: "slow: survive two restarts" }]);
+        const { firstDispatch, firstMessage } = messageSteps(input.steps);
         const threadId = input.projectionThreadIds[0]!;
         const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
 
-        // Phase 1: the server stops while the first answer is still being generated.
+        yield* run(
+          box,
+          "before-restarts",
+          [
+            ...input.steps.slice(0, firstMessage),
+            { ...firstDispatch, await: false, key: "run:1" },
+            { type: "await_run_steerable", threadId, runId },
+          ],
+          input.projectionThreadIds,
+          { tokensPerSecond: 20 },
+        );
+        // The first restart stops again once the reattached turn is streaming.
+        yield* TestClock.adjust("1 second");
+        yield* run(box, "first-restart", [], input.projectionThreadIds, {
+          recoverOnStartup: true,
+          tokensPerSecond: 20,
+          until: awaitReattachedTurn(threadId),
+        });
+        yield* TestClock.adjust("1 second");
+        const recovered = yield* run(
+          box,
+          "second-restart",
+          [{ type: "await_run_status", threadId, runId, status: "completed" }],
+          input.projectionThreadIds,
+          { recoverOnStartup: true, tokensPerSecond: 200 },
+        );
+        const projection = projectionFor(recovered, SCENARIO);
+        const answer = "survive two restarts ".repeat(40).trim();
+        assert.deepEqual(
+          projection.runs.map((entry) => entry.status),
+          ["completed"],
+        );
+        assert.deepEqual(assistantTexts(projection), [answer]);
+        const transcript = yield* durableTranscript(
+          box,
+          projection.providerThreads[0]?.nativeThreadRef?.nativeId ?? "",
+        );
+        assert.deepEqual(
+          transcript.flatMap((entry) =>
+            entry.role === "assistant" && entry.stopReason === "stop" ? [entry.text] : [],
+          ),
+          [`${answer.slice(0, 60)}…`],
+        );
+      }).pipe(
+        Effect.scoped,
+        provideDeterministicTestRuntime,
+        Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer)),
+      ),
+    );
+
+    it.effect("a run whose conversation the restarted store lacks fails without a new one", () =>
+      Effect.gen(function* () {
+        const box = yield* sandbox;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const input = yield* materialize([{ type: "message", text: "slow: lost with its store" }]);
+        const { firstDispatch, firstMessage } = messageSteps(input.steps);
+        const threadId = input.projectionThreadIds[0]!;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+
         const before = yield* run(
           box,
           "before-restart",
@@ -286,60 +511,37 @@ describe.skipIf(WORKER_CLI === undefined)(
           input.projectionThreadIds,
           { tokensPerSecond: 20 },
         );
-        assert.equal(projectionFor(before, SCENARIO).runs[0]?.status, "running");
-
-        // Phase 2: stock startup recovery runs against the same T3 and durable stores.
-        const recovered = yield* run(box, "recovered", [], input.projectionThreadIds, {
-          recoverOnStartup: true,
-        });
-        const afterRecovery = projectionFor(recovered, SCENARIO);
-
-        // Phase 3: the user sends the next message.
-        const after = yield* run(
-          box,
-          "after-restart",
-          input.steps.slice(secondMessage),
+        const nativeRef = projectionFor(before, SCENARIO).providerThreads[0]?.nativeThreadRef;
+        // The server comes back on a different durable store.
+        const replaced = { ...box, dataHome: `${box.dataHome}-replaced` };
+        yield* TestClock.adjust("1 second");
+        const recovered = yield* run(
+          replaced,
+          "replaced-store",
+          [{ type: "await_run_status", threadId, runId, status: "failed" }],
           input.projectionThreadIds,
+          { recoverOnStartup: true },
         );
-        const projection = projectionFor(after, SCENARIO);
-
-        // What a restart now leaves in T3 and in the durable store.
-        const observation = {
-          runStatusesAfterRecovery: afterRecovery.runs.map((entry) => entry.status),
-          runStatusesAfterNextMessage: projection.runs.map((entry) => entry.status),
-          turnItemsAfterNextMessage: projection.turnItems.map((item) => ({
-            runId: item.runId,
-            type: item.type,
-            status: item.status,
-            ...(item.type === "assistant_message" || item.type === "user_message"
-              ? { text: item.text }
-              : {}),
-          })),
-          providerThreads: projection.providerThreads.map(
-            (thread) => thread.nativeThreadRef?.nativeId ?? null,
-          ),
-          durableTranscript: yield* durableTranscript(
-            box,
-            projection.providerThreads[0]?.nativeThreadRef?.nativeId ?? "",
-          ),
-        };
-        const evidenceDir = process.env.T314_EVIDENCE_DIR;
-        if (evidenceDir !== undefined) {
-          const fs = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          yield* fs.writeFileString(
-            path.join(evidenceDir, "s01-orchestrator-restart.json"),
-            `${encodeJson(observation)}\n`,
-          );
-        }
-        assert.equal(afterRecovery.runs[0]?.status, "cancelled");
-        assert.equal(projection.runs[1]?.status, "completed");
-        // The recovered answer was aborted, not finished unseen (S01-E05).
+        const projection = projectionFor(recovered, SCENARIO);
         assert.deepEqual(
-          observation.durableTranscript.flatMap((entry) =>
-            entry.role === "assistant" && entry.stopReason === "stop" ? [entry.text] : [],
+          projection.runs.map((entry) => entry.status),
+          ["failed"],
+        );
+        assert.isTrue(
+          projection.turnItems.some(
+            (item) => item.type === "error" && item.title === "Could not reattach the durable run",
           ),
-          ["echo: after the restart"],
+        );
+        // The thread still names the old conversation, and the new store opened none.
+        assert.deepEqual(projection.providerThreads[0]?.nativeThreadRef, nativeRef);
+        const conversationId = Number(nativeRef?.nativeId?.split(":").at(-1));
+        assert.isFalse(
+          yield* durableConversationExists(
+            replaced.dataHome,
+            replaced.workspace,
+            replaced.stateHome,
+            conversationId,
+          ),
         );
       }).pipe(
         Effect.scoped,
